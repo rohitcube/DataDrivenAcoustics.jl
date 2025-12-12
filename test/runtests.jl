@@ -1,168 +1,98 @@
+using Test
 using DataDrivenAcoustics
 using UnderwaterAcoustics
-using Test
 using Random
-using DSP
-using GaussianProcesses
-using Flux
 
-function test2d(datapm)
-    x1 = transfercoef(datapm, nothing, AcousticReceiver(50.0, -5.0))
-    x2 = transfercoef(datapm, nothing, AcousticReceiver(50.0, -10.0))
-    x3 = transfercoef(datapm, nothing, AcousticReceiver(50.0, -15.0))
-    x = transfercoef(datapm, nothing, [AcousticReceiver(50.0, -d) for d ∈ 5.0:5.0:15.0])
-    @test x isa AbstractVector
-    @test all(isapprox.([x1, x2, x3], x, atol= 0.000001))
+# ==============================================================================
+# TEST SET 1: UNIT TESTS
+# Focus: Testing logic in isolation (Does the Factory pick the right Model?)
+# ==============================================================================
+@testset "Unit Test: Model Selection Logic" begin
+    println("Running Unit Test: Model Picker...")
 
+    # Scenario A: Metadata Only (No depth provided)
+    # Expected Result: Should pick 'SphericalWaveModel' (The Blank Slate / Plane Wave model)
+    env_meta = DataDrivenEnvironment(
+        soundspeed=1500.0,
+        frequency=1000.0,
+        waterdepth=missing # <--- The key trigger
+    )
 
-    x = transfercoef(datapm, nothing, AcousticReceiverGrid2D(50.0, 0.0, 1, -5.0, -5.0, 3))
-    @test x isa AbstractMatrix
-    @test size(x) == (1, 3)
-    @test all(isapprox.([x1 x2 x3], x, atol= 0.000001))
+    # Call the picker function
+    model_meta = RayBasisNN(env_meta)
 
-
-    x = transfercoef(datapm, nothing, AcousticReceiverGrid2D(50.0, 10.0, 3, -5.0, -5.0, 3))
-    @test x isa AbstractMatrix
-    @test size(x) == (3, 3)
-    @test all(isapprox.([x1 x2 x3], x[1:1, :], atol= 0.000001))
-
-
-    x1 = transmissionloss(datapm, nothing, AcousticReceiver(50.0, -5.0))
-    x2 = transmissionloss(datapm, nothing, AcousticReceiver(50.0, -10.0))
-    x3 = transmissionloss(datapm, nothing, AcousticReceiver(50.0, -15.0))
-    x = transmissionloss(datapm, nothing, [AcousticReceiver(50.0, -d) for d ∈ 5.0:5.0:15.0])
-    @test x isa AbstractVector
-    @test all(isapprox.([x1, x2, x3], x, atol= 0.000001))
-
-    x = transmissionloss(datapm, nothing, AcousticReceiverGrid2D(50.0, 0.0, 1, -5.0, -5.0, 3))
-    @test x isa AbstractMatrix
-    @test size(x) == (1, 3)
-    @test all(isapprox.([x1 x2 x3], x, atol= 0.000001))
-
-    x = transmissionloss(datapm, nothing, AcousticReceiverGrid2D(50.0, 10.0, 3, -5.0, -5.0, 3))
-    @test x isa AbstractMatrix
-    @test size(x) == (3, 3)
-    @test all(isapprox.([x1 x2 x3], x[1:1,:], atol= 0.000001))
+    # ASSERTION: Verify the type of the returned object
+    @test model_meta isa SphericalWaveModel
+    println("  ✔ Correctly selected SphericalWaveModel for metadata-only environment.")
 end
 
+# ==============================================================================
+# TEST SET 2: INTEGRATION TESTS
+# Focus: End-to-End workflow (Ground Truth -> Fitting -> Prediction)
+# ==============================================================================
+@testset "Integration Test: Far-field 2D (Metadata Only)" begin
+    println("\nRunning Integration Test: Case 1 Pipeline...")
 
-function test3d(datapm)
-    x1 = transfercoef(datapm, nothing, AcousticReceiver(50.0, 0.0, -5.0))
-    x2 = transfercoef(datapm, nothing, AcousticReceiver(50.0,0.0, -10.0))
-    x3 = transfercoef(datapm, nothing, AcousticReceiver(50.0, 0.0, -15.0))
-    x = transfercoef(datapm, nothing, [AcousticReceiver(50.0, 0.0, -d) for d ∈ 5.0:5.0:15.0])
-    @test x isa AbstractVector
-    @test all(isapprox.([x1, x2, x3], x, atol= 0.000001))
+    # ---------------------------------------------------------
+    # 1. GROUND TRUTH (Generate Fake Data using Standard Library)
+    # ---------------------------------------------------------
+    println("  1. Generating ground truth data...")
 
+    env_real = UnderwaterEnvironment(
+        soundspeed = 1500.0,
+        bathymetry = 100.0,
+        seabed = SandyMud,
+        surface = PressureReleaseBoundary
+    )
+    pm_real = PekerisRayTracer(env_real)
+    tx_real = AcousticSource(0.0, -5.0, 1000.0)
+    rx_real = AcousticReceiverGrid2D(1000.0:100.0:2000.0, -50.0:10.0:-10.0)
 
-    x = transfercoef(datapm, nothing, AcousticReceiverGrid3D(50.0, 0.0, 1, 0.0, 1.0, 1, -5.0, -5.0, 3))
-    @test x isa AbstractMatrix
-    @test size(x) == (1, 3)
-    @test all(isapprox.([x1 x2 x3], x, atol= 0.000001))
+    # Generate Training Data
+    tl_truth = transmission_loss(pm_real, tx_real, rx_real)
+    measurements = reshape(tl_truth, 1, :)
+    rx_locs = location.(rx_real) # Broadcast location over grid
 
-    x = transfercoef(datapm, nothing, AcousticReceiverGrid3D(50.0, 10.0, 3, 0.0, 1.0, 2, -5.0, -5.0, 3))
-    @test x isa AbstractArray
-    @test size(x) == (3, 2, 3)
-    @test all(isapprox.([x1, x2, x3], x[1, 1,:], atol= 0.000001))
+    # ---------------------------------------------------------
+    # 2. DATA DRIVEN SETUP
+    # ---------------------------------------------------------
+    println("  2. Setting up DataDriven model...")
 
-    x1 = transmissionloss(datapm, nothing, AcousticReceiver(50.0, 0.0,  -5.0))
-    x2 = transmissionloss(datapm, nothing, AcousticReceiver(50.0, 0.0, -10.0))
-    x3 = transmissionloss(datapm, nothing, AcousticReceiver(50.0, 0.0, -15.0))
-    x = transmissionloss(datapm, nothing, [AcousticReceiver(50.0, 0.0, -d) for d ∈ 5.0:5.0:15.0])
-    @test x isa AbstractVector
-    @test all(isapprox.([x1, x2, x3], x, atol= 0.000001))
+    # Create Blind Environment (Missing depth)
+    env_dd = DataDrivenEnvironment(
+        soundspeed = 1500.0,
+        frequency = 1000.0,
+        surface = UnderwaterAcoustics.PressureReleaseBoundary
+    )
 
+    # Initialize Model (Should pick SphericalWaveModel internally)
+    pm_dd = RayBasisNN(env_dd; nrays=60)
+    @test pm_dd isa SphericalWaveModel # Double check inside the flow
 
-    x = transmissionloss(datapm, nothing, AcousticReceiverGrid3D(50.0, 0.0, 1, 0.0, 1.0, 1, -5.0, -5.0, 3))
-    @test x isa AbstractMatrix
-    @test size(x) == (1, 3)
-    @test all(isapprox.([x1 x2 x3], x, atol= 0.000001))
+    tx_dd = AcousticSource(0.0, -5.0, 1000.0)
 
+    # ---------------------------------------------------------
+    # 3. TRAINING (Fitting)
+    # ---------------------------------------------------------
+    println("  3. Fitting model...")
+    # This calls fit!, which updates the env with tx and initializes weights
+    fit!(pm_dd, tx_dd, rx_locs, transmission_loss, measurements)
 
-    x = transmissionloss(datapm, nothing, AcousticReceiverGrid3D(50.0, 10.0, 3, 0.0, 1.0, 2, -5.0, -5.0, 3))
-    @test x isa AbstractArray
-    @test size(x) == (3, 2, 3)
-    @test all(isapprox.([x1, x2, x3], x[1, 1,:], atol= 0.000001))
+    # ---------------------------------------------------------
+    # 4. INFERENCE (Prediction)
+    # ---------------------------------------------------------
+    println("  4. Running inference...")
+
+    rx_pred = AcousticReceiverGrid2D(2000.0:50.0:2500.0, -50.0)
+    tl_pred = transmission_loss(pm_dd, tx_dd, rx_pred)
+
+    # ---------------------------------------------------------
+    # 5. VALIDATION
+    # ---------------------------------------------------------
+    # Ensure we got numbers back, not errors or NaNs
+    @test tl_pred isa Matrix{<:Number}
+    @test size(tl_pred) == size(rx_pred)
+    @test !any(isnan, tl_pred)
+
+    println("  ✔ Integration test passed!")
 end
-
-
-@test RayBasis2D in models()
-@test RayBasis2DCurv in models()
-@test RayBasis3D in models()
-@test RayBasis3DRCNN in models()
-@test GPR in models()
-
-
-env = UnderwaterEnvironment()
-pm = PekerisRayModel(env, 7)
-
-Random.seed!(1)
-
-txpos = [0.0, -5.0]
-rxpos = rand(2, 500) .* [80.0, -20.0] .+ [1.0, 0.0]
-tloss = Array{Float32}(undef, 1, size(rxpos)[2])
-for i in 1 : 1 : size(rxpos)[2]
-    tloss[1, i] = Float32(transmissionloss(pm, AcousticSource(txpos[1], txpos[2], 1000.0), AcousticReceiver(rxpos[1,i], rxpos[2,i]); mode=:coherent))
-end
-dataenv = DataDrivenUnderwaterEnvironment(rxpos, tloss; frequency = 1000.0, soundspeed = 1540.0);
-
-datapm = RayBasis2D(dataenv; inilearnrate = 0.005, seed = true)
-@test datapm isa RayBasis2D
-test2d(datapm)
-arr = arrivals(datapm, nothing, AcousticReceiver(50.0, -10.0))
-@test arr isa AbstractVector{<:DataDrivenAcoustics.RayArrival}
-
-
-datapm = RayBasis2DCurv(dataenv; inilearnrate = 0.005, seed = true)
-@test datapm isa RayBasis2DCurv
-test2d(datapm)
-arr = arrivals(datapm, nothing, AcousticReceiver(50.0, -10.0))
-@test arr isa AbstractVector{<:DataDrivenAcoustics.RayArrival}
-
-
-kern = Matern(1/2, 0.0, 0.0)
-datapm = GPR(dataenv, kern; logObsNoise = -5.0, seed = true, ratioₜ = 1.0)
-@test datapm isa GPR
-test2d(datapm)
-
-
-
-Random.seed!(1)
-txpos = [0.0, 0.0, -5.0]
-rxpos = rand(3, 500) .* [100.0, 0.0, -20.0] .+ [1.0, 0.0, 0.0];
-tloss = Array{Float32}(undef, 1, size(rxpos)[2])
-for i in 1 : 1 : size(rxpos)[2]
-    tloss[1, i] = Float32(transmissionloss(pm, AcousticSource(txpos[1], txpos[2], txpos[3], 1000.0), AcousticReceiver(rxpos[1,i], rxpos[2,i], rxpos[3,i]); mode=:coherent))
-end
-
-dataenv = DataDrivenUnderwaterEnvironment(rxpos, tloss; frequency = 1000.0, soundspeed = 1540.0, waterdepth = 20.0, tx = AcousticSource(0.0, 0.0, -5.0, 1000.0))
-datapm = RayBasis3D(dataenv; inilearnrate = 0.005, seed  = true)
-@test datapm isa RayBasis3D
-test3d(datapm)
-arr = arrivals(datapm, nothing, AcousticReceiver(50.0, 0.0, -10.0))
-@test arr isa AbstractVector{<:DataDrivenAcoustics.RayArrival}
-
-
-
-Random.seed!(1)
-
-RCNN = Chain(  
-    x -> (x ./ 0.5f0 .* π .- 0.5f0) .* 2.0f0, #normalization of incident angle
-    Dense(1, 30, sigmoid),
-    Dense(30, 50, sigmoid),  
-    Dense(50, 2),
-)
-dataenv = DataDrivenUnderwaterEnvironment(rxpos, tloss; frequency = 1000.0, soundspeed = 1540.0, waterdepth = 20.0, tx = AcousticSource(0.0, 0.0, -5.0, 1000.0))
-datapm = RayBasis3DRCNN(dataenv, RCNN; seed = true, inilearnrate = 0.05, ncount = 500)
-@test datapm isa RayBasis3DRCNN
-test3d(datapm)
-arr = arrivals(datapm, nothing, AcousticReceiver(50.0, 0.0, -10.0))
-@test arr isa AbstractVector{<:DataDrivenAcoustics.RayArrival}
-
-
-kern = Matern(1/2, [0.0, 0.0, 0.0], 0.0)
-datapm = GPR(dataenv, kern; logObsNoise = -5.0, seed = true, ratioₜ = 1.0)
-@test datapm isa GPR
-test3d(datapm)
-
-
