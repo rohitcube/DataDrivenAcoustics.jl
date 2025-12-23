@@ -342,6 +342,14 @@ mutable struct SphericalWaveModel <: DataDrivenPropagationModel
     theta::Vector{Float64}
 end
 
+mutable struct SphericalWaveModel{E<:DataDrivenUnderwaterEnvironment, AT, PT, TT} <: DataDrivenPropagationModel
+    env::E
+    nrays::Int
+    A::AT      # e.g., Vector{Float64}
+    phi::PT    # e.g., Vector{Float64}
+    theta::TT  # e.g., Vector{Float64}
+end
+
 # "Far-field of a point source... approximated by a planar wavefront"
 function calculate_field(model::SphericalWaveModel, rx_coords::AbstractMatrix)
     c = model.env.soundspeed
@@ -405,6 +413,13 @@ function RayBasisNN(env::DataDrivenUnderwaterEnvironment; nrays=50, kwargs...)
     # Initialsing with empty arrays, so that fit! can be called to train the model
     return SphericalWaveModel(env, nrays, Float64[], Float64[], Float64[])
 end
+
+
+function RayBasisNN(::Type{M}, env::E; nrays=50) where {M<:DataDrivenPropagationModel, E}
+    # Initialize with concrete types (Float64) to maintain stability
+    return M(env, nrays, Float64[], Float64[], Float64[])
+end
+
 
 #= function UnderwaterAcoustics.check(::Type{RayBasis2D}, env::Union{<:DataDrivenUnderwaterEnvironment,Missing})
     if env !== missing
