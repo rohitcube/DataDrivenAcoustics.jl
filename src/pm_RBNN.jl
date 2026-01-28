@@ -35,7 +35,7 @@ A 2D plane wave RBNN formualtion.
 - learning rate is reduced by `reducedlearnrate` once `ncount` is reached (default: 10)
 - set `showloss` to true to display training and validation errors during the model training process, if the validation error is historically the best. (default: `false`)
 """
-Base.@kwdef struct RayBasis2D{T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenPropagationModel{T1}
+Base.@kwdef struct RayBasis2D{T, T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenPropagationModel{T}
     env::T1
     calculatefield::T2
     nrays::Int
@@ -55,16 +55,20 @@ Base.@kwdef struct RayBasis2D{T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenP
 
         seed == true && Random.seed!(6)
 
+        # Detect type T from environment measurements
+        T = hasproperty(env, :measurements) && !ismissing(env.measurements) ?
+            real(eltype(env.measurements)) : Float64
+
         if sum(ismissing.(θ)) > 0
-            θ = rand(nrays) .* π
+            θ = rand(T, nrays) .* π
             trainable = push!!(trainable, θ)
         end
         if sum(ismissing.(A)) > 0
-            A = rand(nrays)
+            A = rand(T, nrays)
             trainable = push!!(trainable, A)
         end
         if sum(ismissing.(ϕ)) > 0
-            ϕ = rand(nrays) .* π
+            ϕ = rand(T, nrays) .* π
             trainable = push!!(trainable, ϕ)
         end
 
@@ -76,7 +80,7 @@ Base.@kwdef struct RayBasis2D{T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenP
                 trainable = push!!(trainable, k)
             end
         end
-        x = new{typeof(env), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, calculatefield, nrays, θ, A, ϕ, k, trainable)
+        x = new{T, typeof(env), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, calculatefield, nrays, θ, A, ϕ, k, trainable)
         ModelFit!(x, inilearnrate, trainloss, dataloss, ratioₜ, seed, maxepoch, ncount, minlearnrate, reducedlearnrate, showloss)
         return x
     end
@@ -124,7 +128,7 @@ A 2D plane wave RBNN formualtion by modeling curvature of wavefornt.
 - set `showloss` to true to display training and validation errors during the model training process, if the validation error is historically the best. (default: `false`)
 
 """
-Base.@kwdef struct RayBasis2DCurv{T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenPropagationModel{T1}
+Base.@kwdef struct RayBasis2DCurv{T, T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenPropagationModel{T}
     env::T1
     calculatefield::T2
     nrays::Int
@@ -143,20 +147,24 @@ Base.@kwdef struct RayBasis2DCurv{T1, T2, T3<:AbstractVector, T4, T5} <: DataDri
         trainable = ()
         seed == true && Random.seed!(6)
 
+        # Detect type T from environment measurements
+        T = hasproperty(env, :measurements) && !ismissing(env.measurements) ?
+            real(eltype(env.measurements)) : Float64
+
         if sum(ismissing.(θ)) > 0
-            θ = rand(nrays) .* π
+            θ = rand(T, nrays) .* π
             trainable = push!!(trainable, θ)
         end
         if sum(ismissing.(A)) > 0
-            A = rand(nrays)
+            A = rand(T, nrays)
             trainable = push!!(trainable, A)
         end
         if sum(ismissing.(ϕ)) > 0
-            ϕ = rand(nrays) .* π
+            ϕ = rand(T, nrays) .* π
             trainable = push!!(trainable, ϕ)
         end
         if sum(ismissing.(d)) > 0
-            d = rand(nrays)
+            d = rand(T, nrays)
             trainable = push!!(trainable, d)
         end
         if k === missing
@@ -167,7 +175,7 @@ Base.@kwdef struct RayBasis2DCurv{T1, T2, T3<:AbstractVector, T4, T5} <: DataDri
                 trainable = push!!(trainable, k)
             end
         end
-        x = new{typeof(env), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, calculatefield, nrays, θ, A, ϕ, d, k, trainable)
+        x = new{T, typeof(env), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, calculatefield, nrays, θ, A, ϕ, d, k, trainable)
         ModelFit!(x, inilearnrate,trainloss, dataloss, ratioₜ, seed, maxepoch, ncount, minlearnrate, reducedlearnrate, showloss)
         return x
     end
@@ -222,7 +230,7 @@ A 3D spherical wave RBNN formualtion.
 - set `showloss` to true to display training and validation errors during the model training process, if the validation error is historically the best. (default: `false`)
 
 """
-Base.@kwdef struct RayBasis3D{T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenPropagationModel{T1}
+Base.@kwdef struct RayBasis3D{T, T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenPropagationModel{T}
     env::T1
     calculatefield::T2
     nrays::Int
@@ -246,41 +254,44 @@ Base.@kwdef struct RayBasis3D{T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenP
         seed == true && Random.seed!(6)
         size(env.locations)[1] == 3 || throw(ArgumentError("RayBasis3D only supports 3D environment."))
 
+        # Detect type T from environment measurements
+        T = hasproperty(env, :measurements) && !ismissing(env.measurements) ?
+            real(eltype(env.measurements)) : Float64
 
         if sum(ismissing.(θ)) > 0
-            θ = rand(nrays) .* π
+            θ = rand(T, nrays) .* π
             trainable = push!!(trainable, θ)
-            eθ = zeros(nrays) .* π
+            eθ = zeros(T, nrays) .* π
         end
         if sum(ismissing.(ψ)) > 0
-            ψ = rand(nrays) .* π
+            ψ = rand(T, nrays) .* π
             trainable = push!!(trainable, ψ)
-            eψ = zeros(nrays) .* π
+            eψ = zeros(T, nrays) .* π
         end
         if sum(ismissing.(d)) > 0
-            d = rand(nrays) .* π
+            d = rand(T, nrays) .* π
             trainable = push!!(trainable, d)
-            ed = zeros(nrays) .* π
+            ed = zeros(T, nrays) .* π
         end
         if sum(ismissing.(eθ)) > 0
-            eθ = zeros(nrays) .* π
+            eθ = zeros(T, nrays) .* π
             trainable = push!!(trainable, eθ)
         end
         if sum(ismissing.(eψ)) > 0
-            eψ = zeros(nrays) .* π
+            eψ = zeros(T, nrays) .* π
             trainable = push!!(trainable, eψ)
         end
         if sum(ismissing.(ed)) > 0
-            ed = zeros(nrays) .* π
+            ed = zeros(T, nrays) .* π
             trainable = push!!(trainable, ed)
         end
 
         if sum(ismissing.(A)) > 0
-            A = rand(nrays)
+            A = rand(T, nrays)
             trainable = push!!(trainable, A)
         end
         if sum(ismissing.(ϕ)) > 0
-            ϕ = rand(nrays) .* π
+            ϕ = rand(T, nrays) .* π
             trainable = push!!(trainable, ϕ)
         end
         if k === missing
@@ -291,7 +302,7 @@ Base.@kwdef struct RayBasis3D{T1, T2, T3<:AbstractVector, T4, T5} <: DataDrivenP
                 trainable = push!!(trainable, k)
             end
         end
-        x = new{typeof(env), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, calculatefield, nrays, θ, ψ, d,  eθ, eψ, ed, A, ϕ, k, trainable)
+        x = new{T, typeof(env), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, calculatefield, nrays, θ, ψ, d,  eθ, eψ, ed, A, ϕ, k, trainable)
         ModelFit!(x, inilearnrate,trainloss, dataloss, ratioₜ, seed, maxepoch, ncount, minlearnrate, reducedlearnrate, showloss)
         return x
     end
@@ -346,7 +357,7 @@ A 3D spherical wave RBNN formualtion with reflection coefficient neural network 
 - set `showloss` to true to display training and validation errors during the model training process, if the validation error is historically the best. (default: `false`)
 
 """
-Base.@kwdef struct RayBasis3DRCNN{T1, T2, T3, T4<:AbstractVector, T5, T6} <: DataDrivenPropagationModel{T1}
+Base.@kwdef struct RayBasis3DRCNN{T, T1, T2, T3, T4<:AbstractVector, T5, T6} <: DataDrivenPropagationModel{T}
     env::T1
     RCNN::T2
     calculatefield::T3
@@ -368,7 +379,12 @@ Base.@kwdef struct RayBasis3DRCNN{T1, T2, T3, T4<:AbstractVector, T5, T6} <: Dat
         length(location(env.tx)) == 3 || throw(ArgumentError("Source location must be 3 dimensional."))
         env.waterdepth !== missing || throw(ArgumentError("Water depth needs to be provided"))
 
+        # Detect type T from environment measurements
+        T = hasproperty(env, :measurements) && !ismissing(env.measurements) ?
+            real(eltype(env.measurements)) : Float64
+
         θ, ψ, d = cartesian2spherical([0.0, 0.0, 0.0].- find_image_src(env.locations[:,1], location(env.tx), nrays, env.waterdepth))
+        θ, ψ, d = T.(θ), T.(ψ), T.(d)
         if k === missing
             if env.soundspeed !== missing && env.frequency !== missing
                 k = 2.0f0 * π * env.frequency / env.soundspeed
@@ -377,7 +393,7 @@ Base.@kwdef struct RayBasis3DRCNN{T1, T2, T3, T4<:AbstractVector, T5, T6} <: Dat
                 trainable = push!!(trainable, k)
             end
         end
-        x = new{typeof(env), typeof(RCNN), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, RCNN, calculatefield, nrays, θ, ψ, d, k, trainable)
+        x = new{T, typeof(env), typeof(RCNN), typeof(calculatefield), typeof(θ), typeof(k), typeof(trainable)}(env, RCNN, calculatefield, nrays, θ, ψ, d, k, trainable)
         ModelFit!(x, inilearnrate,trainloss, dataloss, ratioₜ, seed, maxepoch, ncount, minlearnrate, reducedlearnrate, showloss)
         return x
     end

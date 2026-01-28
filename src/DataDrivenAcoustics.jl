@@ -3,13 +3,12 @@ module DataDrivenAcoustics
 using UnderwaterAcoustics
 using DocStringExtensions
 using DSP: amp2db, db2amp, pow2db, db2pow
-export DataDrivenEnvironment, DataDrivenUnderwaterEnvironment
-export RayBasisNN, SphericalWaveModel
-export fit!
+export BasicDataDrivenUnderwaterEnvironment, DataDrivenUnderwaterEnvironment
+export RayBasisNN, SphericalWaveModel, plane_wave_propagate, PlaneWaveCurvModel
+export fit!, calculate_field
 
 include("pm_core.jl")
 include("pm_utility.jl")
-
 include("pm_RBNN.jl")
 include("pm_GPR.jl")
 

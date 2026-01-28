@@ -1,13 +1,100 @@
 using RecipesBase
 using Printf
+using Random
+using Flux
+using Statistics
 
 # Core abstract types used across propagation models
 abstract type DataDrivenUnderwaterEnvironment end
-abstract type DataDrivenPropagationModel end
+abstract type DataDrivenPropagationModel{T} end
 
 
-export DataDrivenUnderwaterEnvironment, ModelFit!, transfercoef, transmissionloss, check, plot, rays, eigenrays, arrivals, DataDrivenEnvironment
+export DataDrivenUnderwaterEnvironment, fit!, transfercoef, transmissionloss, check, plot, rays, eigenrays, arrivals, plane_wave_propagate, spherical_wave_propagate
+export PlaneWaveCurvModel, calculate_field
 
+# src/physics.jl
+
+"""
+    spherical_wave_propagate(rx_x, rx_y, sx, sy, k, A, phi)
+
+Calculates complex pressure at a single receiver from a single source.
+Differentiable by Zygote.
+"""
+function spherical_wave_propagate(rx_x, rx_y, sx, sy, k, A, phi)
+    # 1. Distance
+    dx = rx_x - sx
+    dy = rx_y - sy
+    r = sqrt(dx^2 + dy^2)
+
+    # 2. Singularity guard (Zygote-friendly softplus or max)
+    r_safe = max(r, 1e-6)
+
+    # 3. Physics (1/r decay + Phase)
+    amp = A / r_safe
+    phase = (k * r_safe) + phi
+
+    return amp * cis(phase) # cis(x) is exp(im*x)
+end
+
+function plane_wave_propagate(x, y, k, A, phi, theta, d)
+    # 1. Project receiver location onto the ray direction vector (Longitudinal)
+    # This matches Scenario 1 & 2 in your test
+    r_long = x * cos(theta) + y * sin(theta)
+
+    # 2. Project receiver location onto the perpendicular vector (Transverse)
+    # This is for the curvature (d) term later
+    r_trans = -x * sin(theta) + y * cos(theta)
+
+    # 3. Calculate Phase
+    # Plane wave term + Curvature term + Phase offset
+    total_phase = (k * r_long) + ((k * r_trans^2) / (2 * d)) + phi
+
+    # 4. Return Complex Pressure
+    return A * exp(im * total_phase)
+end
+
+
+# src/pm_case1.jl
+
+
+# --- Case 1: Far-Field / Plane Wave Model ---
+# "I don't know where the source is, but I can hear it."
+# We learn the Angle (theta) and the Curvature (d) directly.
+
+mutable struct PlaneWaveCurvModel{T, E} <: DataDrivenPropagationModel{T}
+    env::E            # The environment (can be Missing initially)
+    nrays::Int        # Number of "Neurons" in our RBNN
+
+    # --- Trainable Parameters ---
+    # These are the "Weights" and "Biases" of the neural network
+    A::Vector{T}      # Amplitude (Linear weight)
+    phi::Vector{T}    # Phase offset (Bias)
+    theta::Vector{T}  # Direction of Arrival (Non-linear parameter)
+    d::Vector{T}      # Curvature Distance (Non-linear parameter)
+end
+
+# --- The Constructor ---
+# Initializes random rays to cover the whole horizon
+# In PlaneWaveCurvModel constructor:
+
+function PlaneWaveCurvModel(env, nrays::Int)
+    # 1. Detect Precision
+    # We want T to be the REAL backing type (Float64), not ComplexF64.
+    T_meas = hasproperty(env, :measurements) && !ismissing(env.measurements) ?
+             eltype(env.measurements) : Float64
+
+    # FORCE REAL: If measurements are ComplexF64, we want Float64 parameters
+    T = real(T_meas)
+
+    # 2. Random Initialization
+    return PlaneWaveCurvModel(
+        env, nrays,
+        zeros(T, nrays),        # A
+        zeros(T, nrays),        # phi
+        rand(T, nrays) .* 2π,   # theta
+        fill(T(1000.0), nrays)  # d
+    )
+end
 
 """
 $(TYPEDEF)
@@ -24,45 +111,37 @@ Create an underwater environment for data-driven physics-based propagation model
 - `tx`: source location (default: missing)
 - set `dB` to `false` if `measurements` are not in dB scale (default: `true`)
 """
-Base.@kwdef struct BasicDataDrivenUnderwaterEnvironment{T1<:Matrix, T2, T3, T4, T5, T6, T7} <: DataDrivenUnderwaterEnvironment
-    locations::T1
-    measurements::T1
-    soundspeed::T2
-    frequency::T3
-    waterdepth::T4
-    salinity::Real
 
-    # FIX: Renamed from seasurface and removed <:ReflectionModel
-    surface::T5
-    # FIX: Removed <:ReflectionModel
-    seabed::T6
+mutable struct BasicDataDrivenUnderwaterEnvironment{T_Loc, T_Meas, T2, T3, T4, T5, T6, T7} <: DataDrivenUnderwaterEnvironment
+    # SPLIT HERE: distinct types for locations vs measurements
+    locations::Union{T_Loc, Missing}
+    measurements::Union{T_Meas, Missing}
 
-    tx::T7
+    soundspeed::Union{T2, Missing}
+    frequency::Union{T3, Missing}
+    waterdepth::Union{T4, Missing}
+    salinity::Union{Real, Missing}
+    surface::Union{T5, Missing}
+    seabed::Union{T6, Missing}
+    tx::Union{T7, Missing}
     dB::Bool
 
-    function BasicDataDrivenUnderwaterEnvironment(locations, measurements;
+    # Inner Constructor
+    function BasicDataDrivenUnderwaterEnvironment(
+        locations,
+        measurements;
         soundspeed = missing,
         frequency = missing,
         waterdepth = missing,
         salinity = 35.0,
-
-        # FIX: Updated defaults to v0.7+ standards
-        # Note: We use the variables directly (no parentheses) because they are constants in your setup
         surface = UnderwaterAcoustics.PressureReleaseBoundary,
         seabed = UnderwaterAcoustics.SandyMud,
-
         tx = missing,
-        dB = true)
-
-        if  tx !== missing
-            length(location(tx)) == size(locations)[1] || throw(ArgumentError("Dimension of source location and measurement locations do not match"))
-        end
-        size(locations)[2] == size(measurements)[2] || throw(ArgumentError("Number of locations and fields measurements do not match"))
-        size(locations)[1] < 4 || throw(ArgumentError("Dimension of location data should not be larger than 3"))
-        size(measurements)[1] == 1 || throw(ArgumentError("size of acoustic measurements should be 1 × n"))
-
-        # FIX: Pass 'surface' instead of 'seasurface' to new()
-        new{typeof(locations), typeof(soundspeed), typeof(frequency), typeof(waterdepth), typeof(surface), typeof(seabed), typeof(tx)}(
+        dB = true
+    )
+        # Type deduction happens automatically here based on inputs
+        new{typeof(locations), typeof(measurements), typeof(soundspeed), typeof(frequency),
+            typeof(waterdepth), typeof(surface), typeof(seabed), typeof(tx)}(
             locations, measurements, soundspeed, frequency, waterdepth, salinity, surface, seabed, tx, dB
         )
     end
@@ -75,27 +154,31 @@ $(SIGNATURES)
 Create a lightweight data-driven environment without upfront measurements.
 Intended for far-field 2D use where training data are provided directly to `fit!`.
 """
-function DataDrivenEnvironment(;
-        soundspeed = missing,
-        frequency = missing,
-        waterdepth = missing,
-        salinity = 35.0,
-        # Note: Using the v0.7+ constants we identified (no parentheses)
-        surface = UnderwaterAcoustics.PressureReleaseBoundary,
-        seabed = UnderwaterAcoustics.SandyMud,
-        tx = missing,
-        dB = true,
-        dims::Int = 2)
+function BasicDataDrivenUnderwaterEnvironment(;
+    soundspeed = missing,
+    frequency = missing,
+    waterdepth = missing,
+    salinity = 35.0,
+    surface = UnderwaterAcoustics.PressureReleaseBoundary,
+    seabed = UnderwaterAcoustics.SandyMud,
+    tx = missing,
+    dB = true,
+    dims::Int = 2)
 
-    # Create empty placeholders for locations and measurements
+    # 1. Create placeholders
+    # Locations are Real (Float32)
     locations = zeros(Float32, dims, 0)
-    measurements = zeros(Float32, 1, 0)
 
-    return BasicDataDrivenUnderwaterEnvironment(locations, measurements;
-        soundspeed = soundspeed, frequency = frequency, waterdepth = waterdepth,
-        salinity = salinity, surface = surface, seabed = seabed, tx = tx, dB = dB)
+    # Measurements should be COMPLEX (ComplexF32) to prevent future type errors
+    measurements = zeros(ComplexF32, 1, 0)
+
+    # 2. Call the main constructor
+    return BasicDataDrivenUnderwaterEnvironment(
+        locations, measurements;
+        soundspeed=soundspeed, frequency=frequency, waterdepth=waterdepth,
+        salinity=salinity, surface=surface, seabed=seabed, tx=tx, dB=dB
+    )
 end
-
 
 
 """
@@ -143,7 +226,6 @@ function ModelFit!(r::DataDrivenPropagationModel, inilearnrate, trainloss, datal
             showloss && println("********* reduced learning rate: ",opt.eta, " *********" )
         end
     end
-    r
 end
 
 # -------------------------------------------------------------------------
@@ -329,78 +411,263 @@ UnderwaterAcoustics.arrivals(model::DataDrivenPropagationModel, rx::Union{Abstra
 end
 
 # This is the "Case 1" model: Metadata only, Far-field approximation.
-mutable struct SphericalWaveModel <: DataDrivenPropagationModel
 
-    # Typed as the ABSTRACT parent.
-    # This allows it to hold any specific implementation (Missing or Source).
-    env::DataDrivenUnderwaterEnvironment
 
-    nrays::Int
-
-    A::Vector{Float64}
-    phi::Vector{Float64}
-    theta::Vector{Float64}
-end
-
-mutable struct SphericalWaveModel{E<:DataDrivenUnderwaterEnvironment, AT, PT, TT} <: DataDrivenPropagationModel
+mutable struct SphericalWaveModel{T, E} <: DataDrivenPropagationModel{T}
     env::E
     nrays::Int
-    A::AT      # e.g., Vector{Float64}
-    phi::PT    # e.g., Vector{Float64}
-    theta::TT  # e.g., Vector{Float64}
+
+    # We force these to be Vectors of type T.
+    # This is safer than {AT, PT, TT} because it prevents type mixing.
+    A::Vector{T}
+    phi::Vector{T}
+    theta::Vector{T}
 end
 
-# "Far-field of a point source... approximated by a planar wavefront"
-function calculate_field(model::SphericalWaveModel, rx_coords::AbstractMatrix)
-    c = model.env.soundspeed
-    f = model.env.frequency
-    k_mag = 2π * f / c
+function SphericalWaveModel(env, nrays::Int)
+    # Detect T from the environment
+    T = hasproperty(env, :measurements) && !ismissing(env.measurements) ?
+        eltype(env.measurements) : Float64
 
-    n_rx = size(rx_coords, 2)
-    pressure = zeros(ComplexF64, n_rx)
-
-    # Summation of N plane waves
-    for i in 1:n_rx
-        r_vec = rx_coords[:, i]
-        total_p = 0.0 + 0.0im
-
-        for m in 1:model.nrays
-            # k vector based on learned angle theta
-            kx = k_mag * cos(model.theta[m])
-            kz = k_mag * sin(model.theta[m])
-
-            # Phase term: k*r + phi
-            phase = (kx * r_vec[1] + kz * r_vec[end]) + model.phi[m]
-            total_p += model.A[m] * exp(im * phase)
-        end
-        pressure[i] = total_p
-    end
-    return pressure
-end
-
-
-function fit!(model::SphericalWaveModel, tx, rx_locs, loss_func, measurements)
-    # 1. Detect Source Dimensions
-    # We check how many coordinates the source has (usually 3: x, y, z)
-    src_dims = length(location(tx))
-
-    # 2. Update Environment with Matching Dimensions
-    model.env = DataDrivenEnvironment(
-        soundspeed = model.env.soundspeed,
-        frequency  = model.env.frequency,
-        surface    = model.env.surface,
-        tx         = tx,
-        dims       = src_dims  # <--- FIX: Force env to match source dimensions
+    return SphericalWaveModel(
+        env,
+        nrays,
+        zeros(T, nrays), # A
+        zeros(T, nrays), # phi
+        zeros(T, nrays)  # theta
     )
+end
 
-    # 3. Initialize Parameters (Randomly as per literature)
-    rng = Random.default_rng()
-    model.A = rand(rng, model.nrays)
-    model.phi = rand(rng, model.nrays) .* 2π
-    model.theta = rand(rng, model.nrays) .* 2π .- π
+
+# src/pm_case2.jl
+
+function calculate_field(model::SphericalWaveModel, rx_coords, k)
+    # Extract source location once
+    sx, sy = location(model.env.tx)[1], location(model.env.tx)[2]
+
+    # We use a generator comprehension (sum) which Zygote can differentiate through
+    # We broadcast over the receivers (columns of rx_coords)
+
+    # Note: This looks complex but it's just efficient broadcasting
+    # For each receiver i, sum over all rays m
+    preds = [
+        sum(
+            spherical_wave_propagate(rx_coords[1,i], rx_coords[2,i], sx, sy, k, model.A[m], model.phi[m])
+            for m in 1:model.nrays
+        )
+        for i in 1:size(rx_coords, 2)
+    ]
+
+    return preds
+end
+
+# src/pm_case2.jl
+
+# src/pm_case2.jl
+
+function fit!(model::SphericalWaveModel, measurements;
+              max_epochs=10000,          # Increased to match paper standards
+              learning_rate=0.05,        # Higher start (we will decay it)
+              convergence_threshold=1e-9,
+              verbose=false)
+
+    # 1. Extract Geometry & Data
+    rx_locs = model.env.locations
+    meas_vec = vec(measurements)
+    k = 2π * model.env.frequency / model.env.soundspeed
+
+    # --- STRATEGY 1: SMART INITIALIZATION ---
+    # Don't guess. Estimate A from the data using A ≈ P * r
+    if all(model.A .== 0.0)
+        sx, sy = location(model.env.tx)[1], location(model.env.tx)[2]
+
+        # Calculate average range to all sensors
+        avg_r = Statistics.mean(sqrt.((rx_locs[1,:] .- sx).^2 .+ (rx_locs[2,:] .- sy).^2))
+        avg_p = Statistics.mean(abs.(meas_vec))
+
+        # Set A to a physical estimate (e.g. 0.3 instead of 10.0)
+        est_A = avg_p * avg_r
+
+        T = eltype(model.A)
+        model.A .= T(est_A)
+
+        if verbose
+            println("  Initialized Amplitude A ≈ $est_A (Data-Driven)")
+        end
+    end
+
+    # --- STRATEGY 2: NORMALIZATION ---
+    # Scale targets so the max amplitude is 1.0.
+    # This prevents gradients from vanishing due to tiny acoustic numbers.
+    scale_factor = 1.0 / maximum(abs.(meas_vec))
+    target_normalized = meas_vec .* scale_factor
+
+    # Setup Flux
+    ps = Flux.params(model.A, model.phi)
+    opt = Flux.Adam(learning_rate)
+
+    # Loss function calculates error in the NORMALIZED space
+    loss_fn() = Flux.mse(calculate_field(model, rx_locs, k) .* scale_factor, target_normalized)
+
+    # Training Loop
+    prev_loss = Inf
+
+    for epoch in 1:max_epochs
+        # Gradient Step
+        gs = Flux.gradient(loss_fn, ps)
+        Flux.Optimise.update!(opt, ps, gs)
+
+        # Constraint: Keep A positive
+        model.A .= abs.(model.A)
+
+        # --- STRATEGY 3: SCHEDULER ---
+        # Drop learning rate at 50% and 80% of epochs to fine-tune phase
+        if epoch == div(max_epochs, 2)
+            opt.eta *= 0.1
+            verbose && println("  >> Scheduler: Learning Rate dropped to $(opt.eta)")
+        elseif epoch == div(max_epochs * 8, 10)
+            opt.eta *= 0.1
+            verbose && println("  >> Scheduler: Learning Rate dropped to $(opt.eta)")
+        end
+
+        # Logging
+        current_loss = loss_fn()
+        loss_change = abs(prev_loss - current_loss)
+
+        if verbose && (epoch % 500 == 0)
+            # Print REAL (un-normalized) error for human readability
+            real_mse = current_loss / (scale_factor^2)
+            println("Epoch $epoch: NormLoss = $(round(current_loss, digits=6)) | RealMSE = $(real_mse)")
+        end
+
+        if loss_change < convergence_threshold
+            verbose && println("Converged at epoch $epoch")
+            break
+        end
+        prev_loss = current_loss
+    end
 
     return model
 end
+
+
+# src/pm_case1.jl
+
+# ... Include the Struct definition we wrote earlier ...
+
+"""
+    fit!(model::PlaneWaveCurvModel, measurements; kwargs...)
+
+Train PlaneWaveCurvModel to fit acoustic field measurements using gradient descent.
+
+# Arguments
+- `model`: PlaneWaveCurvModel instance (modified in-place)
+- `measurements`: Vector or matrix of complex pressure measurements
+
+# Keyword Arguments
+- `max_epochs`: Maximum number of training epochs (default: 1000)
+- `learning_rate`: Initial learning rate for Adam optimizer (default: 0.01)
+- `convergence_threshold`: Stop if loss change < threshold (default: 1e-6)
+- `verbose`: Print training progress (default: false)
+
+# Returns
+- The trained model
+"""
+function fit!(model::PlaneWaveCurvModel, measurements;
+              max_epochs=5000,
+              learning_rate=0.1,
+              convergence_threshold=1e-8,
+              verbose=false)
+
+    # Fix zero-amplitude initialization issue
+    if all(model.A .== 0.0)
+        T = eltype(model.A)
+        model.A .= T(1.0)  # Initialize closer to expected amplitude
+    end
+
+    # Extract training data from environment
+    rx_locs = model.env.locations
+    meas_vec = vec(measurements)
+    k = 2π * model.env.frequency / model.env.soundspeed
+
+    # Define loss function
+    function loss_fn()
+        predictions = calculatefield(model, rx_locs, k)
+        return Flux.mse(predictions, meas_vec)
+    end
+
+    # Setup optimizer
+    opt = Flux.Adam(learning_rate)
+    ps = Flux.params(model)
+
+    # Training loop with gradient descent
+    prev_loss = Inf
+    for epoch in 1:max_epochs
+        # Compute gradients and update parameters
+        gs = Flux.gradient(loss_fn, ps)
+        Flux.Optimise.update!(opt, ps, gs)
+
+        # Apply parameter constraints (removed theta wrapping - let it evolve freely)
+        model.d .= max.(model.d, 1.0)         # Keep d positive
+
+        # Check convergence
+        current_loss = loss_fn()
+        loss_change = abs(prev_loss - current_loss)
+
+        if verbose && (epoch % 100 == 0)
+            println("Epoch $epoch: Loss = $(current_loss), Change = $(loss_change)")
+        end
+
+        if loss_change < convergence_threshold
+            verbose && println("Converged at epoch $epoch")
+            break
+        end
+
+        prev_loss = current_loss
+    end
+
+    return model
+end
+
+# Make PlaneWaveCurvModel compatible with Flux automatic differentiation
+Flux.@functor PlaneWaveCurvModel
+# Only train A, phi, and theta; keep d fixed to avoid confusing the optimizer
+Flux.trainable(m::PlaneWaveCurvModel) = (m.A, m.phi, m.theta)
+
+"""
+    calculatefield(model::PlaneWaveCurvModel, rx_coords::AbstractMatrix, k::Real)
+
+Calculate acoustic field at receiver locations for PlaneWaveCurvModel.
+
+# Arguments
+- `model`: PlaneWaveCurvModel instance
+- `rx_coords`: Matrix of receiver coordinates (3 x N) where rows are [x, y, z]
+- `k`: Wavenumber (2π * frequency / soundspeed)
+
+# Returns
+- Vector of complex pressures (length N)
+"""
+function calculatefield(model::PlaneWaveCurvModel, rx_coords::AbstractMatrix, k::Real)
+    n_receivers = size(rx_coords, 2)
+
+    # Use a functional approach (Zygote-friendly - no mutation)
+    pressure = [begin
+        x, y = rx_coords[1, i], rx_coords[2, i]
+
+        # Sum contributions from all rays
+        sum(1:model.nrays) do j
+            plane_wave_propagate(
+                x, y, k,
+                model.A[j], model.phi[j], model.theta[j], model.d[j]
+            )
+        end
+    end for i in 1:n_receivers]
+
+    return pressure
+end
+
+# factory function - takes env as input, decides which model to create based on data
+# only returns sphericalwavemodel right now
 function RayBasisNN(env::DataDrivenUnderwaterEnvironment; nrays=50, kwargs...)
 
     # CASE 3-5: We know the depth -> Use Ray Tracing (RayBasis2D)
@@ -409,15 +676,14 @@ function RayBasisNN(env::DataDrivenUnderwaterEnvironment; nrays=50, kwargs...)
     end
 
     # CASE 1-2: We don't know the depth -> Use Spherical/Plane Wave Model
-    # This is what Test Case 1 wil get
-    # Initialsing with empty arrays, so that fit! can be called to train the model
+    #
     return SphericalWaveModel(env, nrays, Float64[], Float64[], Float64[])
 end
 
-
+# constructor - takes model type as argument, tries to construct that specific model type
 function RayBasisNN(::Type{M}, env::E; nrays=50) where {M<:DataDrivenPropagationModel, E}
     # Initialize with concrete types (Float64) to maintain stability
-    return M(env, nrays, Float64[], Float64[], Float64[])
+    M(env, nrays, Float64[], Float64[], Float64[])
 end
 
 
