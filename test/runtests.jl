@@ -3,54 +3,6 @@ using DataDrivenAcoustics
 using UnderwaterAcoustics
 using Random
 
-# ==============================================================================
-# TEST SET 1: UNIT TESTS
-# Focus: Testing logic in isolation (Does the Factory pick the right Model?)
-# ==============================================================================
-#@testset "Unit Test: Model Selection Logic (RayBasisNN)" begin
-    #println("Running Unit Test: Model Picker...")
-
-    ## --- Scenario A: The Blind Case (Case 1) ---
-    ## Context: User provides data but NO source location (tx is missing default)
-    ## New Expectation: Should pick 'PlaneWaveCurvModel' because we have to learn angles from scratch.
-
-    #env_blind = BasicDataDrivenUnderwaterEnvironment(
-        #soundspeed=1500.0,
-        #frequency=1000.0,
-        ## tx is missing by default here
-    #)
-
-    ## Call the factory
-    #model_blind = RayBasisNN(env_blind)
-
-    ## ASSERTION: The type must be the Plane Wave model
-    ## WAS: @test model_meta isa SphericalWaveModel
-    #@test model_blind isa PlaneWaveCurvModel
-    #println("  ✔ Correctly selected PlaneWaveCurvModel for missing source.")
-
-
-    ## --- Scenario B: The Geometric Case (Case 2) ---
-    ## Context: User provides a specific Source location
-    ## New Expectation: Should pick 'SphericalWaveModel' because we can do ray tracing.
-
-    ## We create a dummy source (using a simple NamedTuple or your Source struct)
-    #my_source = AcousticSource(0.0, 0.0, 10.0, 1000.0)
-
-    #env_geo = BasicDataDrivenUnderwaterEnvironment(
-        #soundspeed=1500.0,
-        #frequency=1000.0,
-        #tx = my_source # <--- The Trigger
-    #)
-
-    ## Call the factory
-    #model_geo = RayBasisNN(env_geo)
-
-    ## ASSERTION: The type must be the Spherical model
-    #@test model_geo isa SphericalWaveModel
-    #println("  ✔ Correctly selected SphericalWaveModel for defined source.")
-#end
-
-
 @testset "Case 1: Physics Kernel Math" begin
     # constants
     k = 1.0             # wavenumber
@@ -184,62 +136,35 @@ end
 
 @testset "Case 2: Paper Reproduction (Pekeris Waveguide)" begin
     # ==========================================================================
-    # 1. SETUP THE PHYSICS (Modern API)
+    # 1. LOAD PRE-COMPUTED GROUND TRUTH DATA
     # ==========================================================================
-    println("Generating Ground Truth using PekerisRayTracer...")
+    using Serialization
 
-    f = 5000.0
-    c_water = 1500.0
-    water_depth = 100.0
+    fixture_path = joinpath(@__DIR__, "fixtures", "pekeris_case2.dat")
 
-    # 1. Define Environment using SCALARS (New API)
-    # Default surface is PressureRelease (Vacuum), which is what we want.
-    # We use SandySilt for the bottom (assuming it's exported, otherwise use SandyClay)
-    env_phys = UnderwaterEnvironment(
-        soundspeed = c_water,         # Just a number!
-        bathymetry = water_depth, # Just a number!
-        seabed = SandySilt       # Material type
-    )
+    if !isfile(fixture_path)
+        error("""
+        Fixture file not found: $fixture_path
 
-    # 2. Select the Solver
-    # The docs say PekerisRayTracer is the new name.
-    pm = PekerisRayTracer(env_phys)
-
-    # Source at 50m depth
-    tx = AcousticSource(0.0, 0.0, 50.0, f)
-
-    # ==========================================================================
-    # 2. GENERATE MEASUREMENTS (Training Data)
-    # ==========================================================================
-    println("  Simulating measurements...")
-
-    range_train = [100.0, 105.0]
-    depths_train = range(5.0, 95.0, length=84)
-    n_points = length(range_train) * length(depths_train)
-
-    train_locs = zeros(Float64, 3, n_points)
-    train_meas = zeros(ComplexF64, 1, n_points)
-
-    idx = 1
-    for r in range_train
-        for z in depths_train
-            rx = AcousticReceiver(r, 0.0, z)
-
-            # NEW API: use arrivals() instead of eigenrays()
-            rays = arrivals(pm, tx, rx)
-
-            # Sum phasors from all ray arrivals
-            p_complex = sum(a.phasor for a in rays)
-
-            train_locs[1, idx] = r
-            train_locs[2, idx] = 0.0
-            train_locs[3, idx] = z
-            train_meas[1, idx] = p_complex
-            idx += 1
-        end
+        Please run the following command first to generate ground truth data:
+            julia test/generate_fixtures.jl
+        """)
     end
 
-    println("  Data Generated: $(n_points) sensors.")
+    println("Loading pre-computed ground truth data...")
+    data = open(deserialize, fixture_path)
+
+    train_locs = data["train_locs"]
+    train_meas = data["train_meas"]
+    test_r = data["test_r"]
+    test_z = data["test_z"]
+    p_true = data["p_true"]
+    f = data["f"]
+    c_water = data["c_water"]
+    water_depth = data["water_depth"]
+    tx = data["tx"]
+
+    println("  ✓ Loaded $(size(train_locs, 2)) training points")
 
     # ==========================================================================
     # 3. SETUP THE MODEL (The "Brain")
@@ -263,7 +188,7 @@ end
     # ==========================================================================
     println("  Starting Training...")
 
-    # 5kHz optimization
+    # 5kHz optimization - Using 3000 epochs to ensure convergence
     fit!(model, train_meas;
          max_epochs=3000,
          learning_rate=0.01,
@@ -274,23 +199,23 @@ end
     # ==========================================================================
     println("  Validating...")
 
-    test_r = 102.5
-    test_z = 50.0
-
-    # 1. Ground Truth (New API)
-    rx_test = AcousticReceiver(test_r, 0.0, test_z)
-    rays_test = arrivals(pm, tx, rx_test)
-    p_true = sum(a.phasor for a in rays_test)
-
-    # 2. Prediction
+    # Prediction (ground truth p_true was loaded from fixture)
     test_coord = reshape([test_r, 0.0, test_z], 3, 1)
     k_val = 2π * f / c_water
     p_pred = calculate_field(model, test_coord, k_val)[1]
 
+    # Calculate NMSE (as used in literature)
+    mse = abs2(p_pred - p_true)
+    signal_power = abs2(p_true)
+    nmse = mse / signal_power
+
     println("  Truth: $(abs(p_true))")
     println("  Pred:  $(abs(p_pred))")
+    println("  NMSE:  $nmse")
 
-    @test isapprox(abs(p_pred), abs(p_true), rtol=0.2)
+    # NMSE threshold of 0.04 corresponds to 20% relative error
+    # (0.2^2 = 0.04)
+    @test nmse < 0.04
 end
 
 # ==============================================================================
