@@ -3,6 +3,7 @@ using Printf
 using Random
 using Flux
 using Statistics
+using UnderwaterAcoustics: RayArrival, location
 
 # Core abstract types used across propagation models
 abstract type DataDrivenUnderwaterEnvironment end
@@ -315,10 +316,50 @@ UnderwaterAcoustics.transmission_loss(model::DataDrivenPropagationModel, rx::Uni
 UnderwaterAcoustics.transmission_loss(model::DataDrivenPropagationModel, tx::Union{Missing, Nothing, AcousticSource}, rx::Union{AbstractVector, AbstractMatrix}) = -amp2db.(abs.(acoustic_field(model, tx, rx)))
 
 
-# 6. RENAME: eigenenPropagationModel, tx, rx) = throw(ArgumentError("This function is not yet supported"))
+# multiple dispatch; specifically for PLaneWaveCUrvModel
+#
+function UnderwaterAcoustics.arrivals(model::PlaneWaveCurvModel, tx, rx)
+    # 1. Extract Geometry from the Receiver object
+    # rx location is [x, y, z]. We need range r and depth z.
+    loc = location(rx)
+    r_val = sqrt(loc[1]^2 + loc[2]^2)
+    z_val = loc[3]
 
-UnderwaterAcoustics.arrivals(model::DataDrivenPropagationModel, tx, rx) = throw(ArgumentError("This function is not yet supported"))
+    # 2. Get Physics Constants from the stored environment
+    # Note: We assume model.env was initialized with these properties
+    f = model.env.frequency
+    c = model.env.soundspeed
+    k = 2π * f / c
 
+    # 3. Create a list of "Rays" (one per neuron)
+    results = RayArrival[]
+
+    for i in 1:model.nrays
+        # --- REPLICATE THE PHYSICS KERNEL ---
+        # We calculate exactly how much pressure this specific neuron/ray
+        # contributes to the receiver location.
+
+        r_local = r_val - 1000.0 # Center offset (matches calculate_field logic)
+        θ = model.theta[i]
+        d = model.d[i]
+        A = model.A[i]
+        ϕ = model.phi[i]
+
+        # Calculate Phase (Plane Wave + Curvature)
+        phase_plane = k * (r_local * cos(θ) + z_val * sin(θ))
+        phase_curv  = (k * z_val^2) / (2 * d)
+
+        # The Complex Pressure Contribution (The Phasor)
+        p_contribution = A * cis(phase_plane + phase_curv + ϕ)
+
+        # --- CONSTRUCT THE RAY OBJECT ---
+        # Arguments: (time, phasor, launch_angle, arrival_angle, surface_bounces, bottom_bounces)
+        # We set time=0 and bounces=0 because RBNNs abstract these away.
+        push!(results, RayArrival(0.0, p_contribution, 0.0, θ, 0, 0))
+    end
+
+    return results
+end
 
 # 7. COMMENT OUT CONFLICTING TYPES
 # UnderwaterAcoustics already defines Arrival, so we comment this out to avoid a crash.
