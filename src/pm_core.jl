@@ -90,10 +90,10 @@ function PlaneWaveCurvModel(env, nrays::Int)
     # 2. Random Initialization
     return PlaneWaveCurvModel(
         env, nrays,
-        zeros(T, nrays) .* 0.1,        # A: FIX: Small random values (NOT ZERO)
-        zeros(T, nrays),        # phi
-        rand(T, nrays) .* 2π,   # theta
-        fill(T(1000.0), nrays)  # d
+        randn(T, nrays) .* 0.01,       # A: Small random amplitudes (NOT ZERO!)
+        zeros(T, nrays),               # phi: Phase offsets start at zero
+        rand(T, nrays) .* 2π,          # theta: Random angles covering full circle
+        fill(T(1000.0), nrays)         # d: Curvature distance (will be optimized)
     )
 end
 

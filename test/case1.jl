@@ -130,9 +130,23 @@ end
     train_locs = zeros(3, length(train_r))
     train_locs[1, :] = train_r
     train_locs[3, :] = train_z
-    train_meas = reshape(train_p, 1, :)
+    scale_factor = 1e6
+    train_meas = reshape(train_p .* scale_factor, 1, :)
 
     println("   Generated $(length(train_p)) measurements.")
+
+    # Data quality checks
+    n_zeros = count(abs.(train_p) .< 1e-15)
+    n_nans = count(isnan.(train_p))
+    println("   Data diagnostics:")
+    println("     - Zero measurements: $n_zeros / $(length(train_p))")
+    println("     - NaN measurements: $n_nans")
+    println("     - Z range: $(extrema(train_locs[3, :]))")
+    println("     - Pressure magnitude range: $(extrema(abs.(train_p)))")
+
+    if n_nans > 0
+        error("Training data contains NaN values!")
+    end
 
     println("3. Training RBNN...")
 
@@ -151,6 +165,13 @@ end
     opt = Flux.Adam(0.01)
     ps = Flux.params(model)
     target_amp = abs.(vec(train_meas))
+
+    # Check initial loss before training
+    initial_preds = calculate_field(model, train_locs, 2π*f/c)
+    initial_loss = loss_fn(initial_preds, target_amp)
+    println("   Initial loss (before training): $initial_loss")
+    println("   Initial prediction range: $(extrema(abs.(initial_preds)))")
+    println("   Target amplitude range: $(extrema(target_amp))")
 
     for epoch in 1:3000
         grads = Flux.gradient(ps) do
