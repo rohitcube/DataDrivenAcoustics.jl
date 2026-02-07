@@ -89,7 +89,7 @@ function PlaneWaveCurvModel(env, nrays::Int)
     # 2. Random Initialization
     return PlaneWaveCurvModel(
         env, nrays,
-        zeros(T, nrays),        # A
+        zeros(T, nrays) .* 0.1,        # A: FIX: Small random values (NOT ZERO)
         zeros(T, nrays),        # phi
         rand(T, nrays) .* 2π,   # theta
         fill(T(1000.0), nrays)  # d
