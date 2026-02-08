@@ -38,6 +38,19 @@ function DataDrivenAcoustics.calculate_field(model::PlaneWaveCurvModel, coord::A
     return sum(ray_contribution(i) for i in 1:model.nrays)
 end
 
+function initialize_angles(env, nrays::Int, strategy, T::Type; source_depth=0.0) # <--- Add keyword
+    if strategy == :auto || strategy == :smart_cone
+        return smart_initialize_angles(env, nrays, T; source_depth=source_depth) # <--- Pass it down
+
+    elseif strategy == :horizontal
+        return randn(T, nrays) .* T(0.1)
+
+    # ... (rest of cases remain same) ...
+    else
+        error("Unknown init strategy")
+    end
+end
+
 # ============================================================================
 # HELPER FUNCTIONS (To be moved to src/ later)
 # ============================================================================
@@ -68,80 +81,75 @@ Train the PlaneWaveCurvModel to fit training data.
 """
 function fit!(model::PlaneWaveCurvModel, train_locs, train_meas;
               init_angles=:auto,
+              source_depth=0.0,
               reinit=false,
-              max_epochs=3000,
+              max_epochs=5000,
               learning_rate=0.01,
               verbose=true,
               log_interval=500,
-              scale_factor=1e6,
-              min_curvature=50.0)
+              min_curvature=50.0,
+              alpha=1e-4) # <--- NEW: Regularization Strength
 
     T = eltype(model.theta)
     nrays = model.nrays
-
-    # Check if model needs initialization
     needs_init = all(model.theta .== 0) || reinit
 
     if needs_init
-        verbose && @info "Initializing model parameters with strategy: $init_angles"
-
-        # Initialize angles
-        model.theta .= initialize_angles(model.env, nrays, init_angles, T)
-
-        # Initialize other parameters
-        model.A .= randn(T, nrays) .* T(0.1)
+        verbose && @info "Initializing parameters..."
+        model.theta .= initialize_angles(model.env, nrays, init_angles, T; source_depth=source_depth)
+        model.A .= rand(T, nrays) .* T(0.1)
         model.phi .= zeros(T, nrays)
-        # d (curvature) keeps its default value or could be reset here
-
-    else
-        verbose && @info "Continuing training with existing parameters (use reinit=true to restart)"
     end
 
-    # Setup optimization
-    loss_fn(x, y) = Flux.mse(abs.(x), abs.(y))
+    # --- THE PAPER'S LOSS FUNCTION ---
+    # 1. MSE on Amplitude (Linear, normalized 0-1)
+    # 2. L1 Penalty on Amplitudes (Enforces Sparsity)
+    loss_fn(pred, target) = begin
+        mse_term = Flux.mse(abs.(pred), abs.(target))
+        l1_term = alpha * sum(abs, model.A)
+        return mse_term + l1_term
+    end
+
     opt = Flux.Adam(learning_rate)
     ps = Flux.params(model)
     target_amp = abs.(vec(train_meas))
-
-    # Get wavenumber from environment
     k = 2π * model.env.frequency / model.env.soundspeed
-
-    # Check initial state
-    if verbose
-        initial_preds = calculate_field(model, train_locs, k)
-        initial_loss = loss_fn(initial_preds, target_amp)
-        println("   Initial loss (before training): $initial_loss")
-        println("   Initial prediction range: $(extrema(abs.(initial_preds)))")
-        println("   Target amplitude range: $(extrema(target_amp))")
-    end
 
     # Training loop
     loss_history = Float64[]
 
     for epoch in 1:max_epochs
+        # Optional: Decay LR for fine-tuning
+        if epoch == 3000
+             opt.eta *= 0.1
+             verbose && println("   [Scheduler] Dropping LR to $(opt.eta)")
+        end
+
         grads = Flux.gradient(ps) do
             preds = calculate_field(model, train_locs, k)
             loss_fn(preds, target_amp)
         end
         Flux.update!(opt, ps, grads)
 
-        # Apply curvature clamping for stability
+        # Clamp Curvature
         for i in 1:model.nrays
             if abs(model.d[i]) < min_curvature
                 model.d[i] = sign(model.d[i]) * min_curvature
             end
         end
 
-        # Logging
         if verbose && (epoch % log_interval == 0)
-            curr_loss = loss_fn(calculate_field(model, train_locs, k), target_amp)
-            println("   Epoch $epoch: Loss = $curr_loss")
-            push!(loss_history, curr_loss)
+            # Log only the MSE part to track performance (exclude L1 from log for clarity)
+            preds = calculate_field(model, train_locs, k)
+            curr_mse = Flux.mse(abs.(preds), target_amp)
+            l1_val = sum(abs, model.A)
+
+            println("   Epoch $epoch: MSE = $(round(curr_mse, digits=6)) | L1 Sum = $(round(l1_val, digits=4))")
+            push!(loss_history, curr_mse)
         end
     end
 
     verbose && println("   Training complete!")
-
     return loss_history
 end
 
@@ -151,13 +159,9 @@ end
 
 Initialize plane wave angles based on strategy.
 """
-function initialize_angles(env, nrays::Int, strategy, T::Type)
-    if strategy == :auto
-        return smart_initialize_angles(env, nrays, T)
-
-    elseif strategy == :uniform
-        @warn "Using uniform random initialization. May converge slowly for directional geometries."
-        return rand(T, nrays) .* T(2π) .- T(π)
+function initialize_angles(env, nrays::Int, strategy, T::Type; source_depth=0.0) # <--- Add keyword
+    if strategy == :auto || strategy == :smart_cone
+        return smart_initialize_angles(env, nrays, T; source_depth=source_depth) # <--- Pass it down
 
     elseif strategy == :horizontal
         return randn(T, nrays) .* T(0.1)
@@ -185,41 +189,35 @@ end
 Automatically determine angle initialization based on source-receiver geometry.
 Falls back to moderate horizontal spread if geometry information is unavailable.
 """
-function smart_initialize_angles(env, nrays::Int, T::Type)
-    # Try to extract receiver positions from environment
-    # This will depend on your actual environment structure
 
-    # For BasicDataDrivenUnderwaterEnvironment, measurements might be stored differently
-    # Fallback: use moderate spread around horizontal
-    @info "Smart initialization: Using moderate horizontal spread (±17°) as default"
-    return randn(T, nrays) .* T(0.3)
+function smart_initialize_angles(env, nrays::Int, T::Type; source_depth=0.0)
+    # 1. Extract Receiver Locations (3xN matrix)
+    # We assume env.locations is [r; y; z]
+    if !hasproperty(env, :locations)
+         @warn "Environment has no locations. Defaulting to horizontal."
+         return randn(T, nrays) .* T(0.1)
+    end
 
-    # TODO: Implement actual geometry analysis when env structure is known
-    # Example structure if receivers are available:
-    # if hasproperty(env, :receiver_positions) && !isempty(env.receiver_positions)
-    #     receivers = env.receiver_positions
-    #     source = hasproperty(env, :source_position) ? env.source_position : [0.0, 0.0, 0.0]
-    #
-    #     angles_to_receivers = T[]
-    #     for receiver in eachcol(receivers)
-    #         dx = receiver[1] - source[1]
-    #         dz = receiver[3] - source[3]
-    #         angle = atan(dz, dx)
-    #         push!(angles_to_receivers, angle)
-    #     end
-    #
-    #     min_angle = minimum(angles_to_receivers)
-    #     max_angle = maximum(angles_to_receivers)
-    #     angle_center = (min_angle + max_angle) / 2
-    #     angle_spread = (max_angle - min_angle) / 2
-    #
-    #     angle_spread *= T(1.2)  # 20% margin
-    #     angle_spread = clamp(angle_spread, T(0.1), T(π/4))
-    #
-    #     @info "Smart initialization: center=$(round(rad2deg(angle_center), digits=1))°, spread=±$(round(rad2deg(angle_spread), digits=1))°"
-    #
-    #     return angle_center .+ randn(T, nrays) .* angle_spread
-    # end
+    r_vals = env.locations[1, :]
+    z_vals = env.locations[3, :]
+
+    # 2. Calculate Angle to every receiver: atan(dz, dr)
+    # Note: In acoustics, positive z is down.
+    # angle = atan(z_receiver - z_source, range)
+    direct_angles = atan.(z_vals .- source_depth, r_vals)
+
+    # 3. Define the Cone
+    min_ang, max_ang = minimum(direct_angles), maximum(direct_angles)
+    center_ang = (min_ang + max_ang) / 2
+
+    # Width: Cover the receivers + 15 degrees extra for surface/bottom bounces
+    # We ensure the cone is at least +/- 15 degrees (approx 0.26 rad) wide.
+    half_width = max((max_ang - min_ang)/2 * 1.2, deg2rad(15))
+
+    @info "Smart Cone: Center $(round(rad2deg(center_ang), digits=1))°, Width +/- $(round(rad2deg(half_width), digits=1))°"
+
+    # 4. Generate Rays (Gaussian distribution centered on target)
+    return center_ang .+ randn(T, nrays) .* half_width
 end
 
 
@@ -412,55 +410,54 @@ end
 @testset "Case 1: Range-Dependent Bathymetry (Bellhop)" begin
 
     println("\n" * "="^60)
-    println("STARTING CASE 1 VALIDATION")
+    println("STARTING CASE 1 VALIDATION (With Normalization & Smart Init)")
     println("="^60)
 
     # 1. Setup Environment
-    println("1. Setting up Environment (Sloping Bottom)...")
     f = 10_000.0
     c = 1541.0
-
-    env_truth = UnderwaterEnvironment(
-        soundspeed = c,
-        seabed = SandyClay,
-        bathymetry = 100.0
-    )
-
+    # Note: Using negative Z for depth per your convention
+    env_truth = UnderwaterEnvironment(soundspeed=c, seabed=SandyClay, bathymetry=100.0)
     tx = AcousticSource(0.0, 0.0, -5.0, f)
-    println("   Created source at depth 5.0m (z = -5.0)")
 
-    println("   Initializing Bellhop...")
-    pm_truth = Bellhop(env_truth; nbeams=2000, min_angle=-10°, max_angle=10°, debug=false)
-    println("   Bellhop initialized successfully")
+    pm_truth = Bellhop(env_truth; nbeams=2000, min_angle=-10°, max_angle=10°)
 
     # 2. Generate Training Data
     println("2. Generating Zig-Zag Training Data...")
     train_r, train_z, train_p = generate_zigzag_data(
-        pm_truth, tx,
-        (1000.0, 1050.0),  # r_range
-        (-5.0, -30.0),      # z_range
-        1000,               # n_points
-        9                   # n_profiles
+        pm_truth, tx, (1000.0, 1050.0), (-5.0, -30.0), 1000, 9
     )
 
     train_locs = stack_coordinates(train_r, train_z)
-    train_meas = prepare_measurements(train_p, 1e6)
+
+    # --- FIX 1: MAX NORMALIZATION (Critical for Gradient Stability) ---
+    # We divide by the maximum pressure so targets are exactly 0.0 to 1.0.
+    # This prevents the "Exploding Gradient" vs "Staying Quiet" conflict.
+    max_p = maximum(abs.(train_p))
+    train_meas_norm = reshape(train_p ./ max_p, 1, :)
+
+    println("   [Data] Max Pressure in dataset: $max_p Pa")
+    println("   [Data] Normalized Target Range: $(extrema(abs.(train_meas_norm)))")
 
     # 3. Train Model
     println("3. Training RBNN...")
+    # Pass the NORMALIZED data to the environment
     env_dd = BasicDataDrivenUnderwaterEnvironment(
-        train_locs, train_meas;
-        soundspeed = c, frequency = f, waterdepth = 30.0
+        train_locs, train_meas_norm;
+        soundspeed=c, frequency=f, waterdepth=30.0
     )
 
     model = PlaneWaveCurvModel(env_dd, 60)
 
-    loss_history = fit!(model, train_locs, train_meas,
-                       init_angles=:horizontal,
-                       max_epochs=3000,
-                       learning_rate=0.01,
-                       verbose=true,
-                       log_interval=500)
+    # --- FIX 2: FIT WITH SMART ARGS ---
+    loss_history = fit!(model, train_locs, train_meas_norm;
+                        init_angles=:auto,
+                        source_depth=-5.0,
+                        max_epochs=5000,
+                        learning_rate=0.02, # Slightly higher initial rate to fight L1
+                        alpha=1e-4,         # <--- TRY THIS (Sparsity Penalty)
+                        verbose=true,
+                        log_interval=500)
 
     # 4. Validate
     println("4. Validating on Dense Grid...")
@@ -471,22 +468,17 @@ end
         model, pm_truth, tx,
         val_r, val_z,
         frequency=f, soundspeed=c,
-        scale_factor=1e6
+        # --- THE FIX ---
+        # The function divides by scale_factor.
+        # We want to multiply by max_p.
+        # So we pass (1 / max_p) to trick it.
+        scale_factor = 1.0 / max_p
     )
-
-    # 5. Results and Assertions
+    # 5. Results
     println("-"^40)
     println("   FINAL RESULTS")
     println("   RMS Error: $(round(rms_error, digits=2)) dB")
     println("-"^40)
 
     @test rms_error < 4.5
-
-    if rms_error < 3.5
-        println("   [SUCCESS] Matches Error-Free Benchmark!")
-    elseif rms_error < 4.5
-        println("   [PASS] Within Acceptable Limits.")
-    else
-        println("   [FAIL] Error too high.")
-    end
 end
