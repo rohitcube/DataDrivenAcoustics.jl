@@ -6,8 +6,10 @@ using DSP: amp2db, db2amp, pow2db, db2pow
 export BasicDataDrivenUnderwaterEnvironment, DataDrivenUnderwaterEnvironment
 export RayBasisNN, SphericalWaveModel, plane_wave_propagate, PlaneWaveCurvModel
 export fit!, calculate_field
+export initialize_angles, smart_initialize_angles, stack_coordinates, prepare_measurements
 
 include("pm_core.jl")
+include("pm_core_case1.jl")
 include("pm_utility.jl")
 include("pm_RBNN.jl")
 include("pm_GPR.jl")

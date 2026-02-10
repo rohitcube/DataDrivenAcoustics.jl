@@ -3,6 +3,7 @@ using DataDrivenAcoustics
 using UnderwaterAcoustics
 using Random
 
+
 @testset "Case 1: Physics Kernel Math" begin
     # constants
     k = 1.0             # wavenumber
@@ -67,40 +68,6 @@ end
 
     # Allow small error (0.05 rad) because optimization isn't perfect
     @test isapprox(learned_theta, true_theta, atol=0.05)
-end
-
-@testset "Case 1: Learning Capability - DEBUG" begin
-    true_theta = π/4
-    true_d = 1000.0
-    k = 2π * 100.0 / 1500.0
-
-    rx_locs = zeros(3, 10)
-    rx_locs[1, :] = range(0, 20, length=10)
-
-    measurements = ComplexF64[]
-    for i in 1:10
-        x, y = rx_locs[1,i], rx_locs[2,i]
-        push!(measurements, plane_wave_propagate(x, y, k, 1.0, 0.0, true_theta, true_d))
-    end
-
-    env = BasicDataDrivenUnderwaterEnvironment(rx_locs, reshape(measurements, 1, :);
-                                             frequency=100.0, soundspeed=1500.0)
-    model = PlaneWaveCurvModel(env, 1)
-
-    # Check initial state
-    println("Initial A: ", model.A)
-    println("Initial theta: ", model.theta)
-    println("Initial d: ", model.d)
-
-    model.theta .= 0.5
-
-    # Train with verbose output
-    trained_model = fit!(model, measurements; verbose=true, max_epochs=5000, learning_rate=0.1)
-
-    println("Final A: ", trained_model.A)
-    println("Final theta: ", trained_model.theta)
-    println("Final d: ", trained_model.d)
-    println("Target theta: ", true_theta)
 end
 
 
