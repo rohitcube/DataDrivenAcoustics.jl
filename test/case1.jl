@@ -244,26 +244,26 @@ Validate a trained model against Bellhop ground truth on a grid.
 function validate_against_bellhop(model, pm_truth, tx,
                                   r_range, z_range;
                                   frequency, soundspeed,
-                                  scale_factor=1e6)
+                                  max_pressure)  # ✅ Changed parameter name
 
     errors_db = Float64[]
     k = 2π * frequency / soundspeed
 
     for r in r_range
         for z in z_range
-            # 1. Ground Truth (Bellhop)
+            # 1. Ground Truth (Bellhop) - in Pascals
             rx = AcousticReceiver(r, 0.0, z)
             rays_true = arrivals(pm_truth, tx, rx)
             p_true = isempty(rays_true) ? 0.0im : sum(ray.phasor for ray in rays_true)
 
-            # 2. Model Prediction
+            # 2. Model Prediction (normalized 0-1)
             coord = reshape([r, 0.0, z], 3, 1)
-            p_pred_scaled = calculate_field(model, coord, k)[1]
+            p_pred_normalized = calculate_field(model, coord, k)[1]
 
-            # Convert back from scaled units to Pascals
-            p_pred = p_pred_scaled / scale_factor
+            # 3. Denormalize: MULTIPLY by max_pressure to get Pascals
+            p_pred = p_pred_normalized * max_pressure  # ✅ MULTIPLY, not divide!
 
-            # 3. Calculate dB error
+            # 4. Calculate dB error (NO ALPHA - pure accuracy)
             db_true = 20 * log10(abs(p_true) + 1e-12)
             db_pred = 20 * log10(abs(p_pred) + 1e-12)
 
@@ -454,8 +454,8 @@ end
                         init_angles=:auto,
                         source_depth=-5.0,
                         max_epochs=5000,
-                        learning_rate=0.02, # Slightly higher initial rate to fight L1
-                        alpha=1e-4,         # <--- TRY THIS (Sparsity Penalty)
+                        learning_rate=0.01, # Slightly higher initial rate to fight L1
+                        alpha=5e-3,         # <--- TRY THIS (Sparsity Penalty)
                         verbose=true,
                         log_interval=500)
 
@@ -468,11 +468,7 @@ end
         model, pm_truth, tx,
         val_r, val_z,
         frequency=f, soundspeed=c,
-        # --- THE FIX ---
-        # The function divides by scale_factor.
-        # We want to multiply by max_p.
-        # So we pass (1 / max_p) to trick it.
-        scale_factor = 1.0 / max_p
+        max_pressure=max_p  # Pass max_p directly
     )
     # 5. Results
     println("-"^40)
