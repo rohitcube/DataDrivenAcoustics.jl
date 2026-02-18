@@ -10,7 +10,7 @@ abstract type DataDrivenUnderwaterEnvironment end
 abstract type DataDrivenPropagationModel{T} end
 
 
-export DataDrivenUnderwaterEnvironment, fit!, transfercoef, transmissionloss, check, plot, rays, eigenrays, arrivals, plane_wave_propagate, spherical_wave_propagate
+export DataDrivenUnderwaterEnvironment, fit!, transfercoef, transmission_loss, check, plot, rays, eigenrays, arrivals, plane_wave_propagate, spherical_wave_propagate
 export PlaneWaveCurvModel, calculate_field
 
 # src/physics.jl
@@ -74,26 +74,22 @@ mutable struct PlaneWaveCurvModel{T, E} <: DataDrivenPropagationModel{T}
     d::Vector{T}      # Curvature Distance (Non-linear parameter)
 end
 
+Flux.@functor PlaneWaveCurvModel (A, phi, theta, d)
+
 # --- The Constructor ---
 # Initializes random rays to cover the whole horizon
 # In PlaneWaveCurvModel constructor:
-
 function PlaneWaveCurvModel(env, nrays::Int)
-    # 1. Detect Precision
-    # We want T to be the REAL backing type (Float64), not ComplexF64.
-    T_meas = hasproperty(env, :measurements) && !ismissing(env.measurements) ?
-             eltype(env.measurements) : Float64
+    # Default to Float64 parameters
+    T = Float64
 
-    # FORCE REAL: If measurements are ComplexF64, we want Float64 parameters
-    T = real(T_meas)
-
-    # 2. Random Initialization
+    # Simple random initialization
     return PlaneWaveCurvModel(
         env, nrays,
-        randn(T, nrays) .* 0.01,       # A: Small random amplitudes (NOT ZERO!)
-        zeros(T, nrays),               # phi: Phase offsets start at zero
-        rand(T, nrays) .* 2π,          # theta: Random angles covering full circle
-        fill(T(1000.0), nrays)         # d: Curvature distance (will be optimized)
+        randn(T, nrays) .* 0.01,       # A: Small random amplitudes
+        zeros(T, nrays),               # phi: Start at zero
+        rand(T, nrays) .* 2π,          # theta: Full circle coverage
+        fill(T(1000.0), nrays)         # d: Initial curvature
     )
 end
 
@@ -107,7 +103,7 @@ Create an underwater environment for data-driven physics-based propagation model
 - `frequency`: source frequency (default: missing)
 - `waterdepth`: water depth (default: missing)
 - `salinity`: water salinity (default: 35)
-- `seasurface`: surface property (dafault: Vacuum)
+- `surface`: surface property (default: PressureReleaseBoundary)
 - `seabed`: seabed property (default: SandySilt)
 - `tx`: source location (default: missing)
 - set `dB` to `false` if `measurements` are not in dB scale (default: `true`)
@@ -434,10 +430,13 @@ end
 UnderwaterAcoustics.arrivals(model::DataDrivenPropagationModel, rx::Union{AbstractVector, AcousticReceiver}) =
     UnderwaterAcoustics.arrivals(model, nothing, rx)
 
-@recipe function plot(env::DataDrivenUnderwaterEnvironment; receivers = [], transmissionloss = [],  dynamicrange = 42.0)
-    size(transmissionloss) == size(receivers) || throw(ArgumentError("Mismatched receivers and transmissionloss"))
+@recipe function plot(env::DataDrivenUnderwaterEnvironment; receivers = [], transmission_loss = [], transmissionloss = missing, dynamicrange = 42.0)
+    if transmissionloss !== missing && isempty(transmission_loss)
+        transmission_loss = transmissionloss
+    end
+    size(transmission_loss) == size(receivers) || throw(ArgumentError("Mismatched receivers and transmission_loss"))
     receivers isa AcousticReceiverGrid2D || throw(ArgumentError("Receivers must be an instance of AcousticReceiverGrid2D"))
-    minloss = minimum(transmissionloss)
+    minloss = minimum(transmission_loss)
     clims --> (-minloss-dynamicrange, -minloss)
     colorbar --> true
     cguide --> "dB"
@@ -447,7 +446,7 @@ UnderwaterAcoustics.arrivals(model::DataDrivenPropagationModel, rx::Union{Abstra
     yguide --> "z (m) "
     @series begin
         seriestype := :heatmap
-        receivers.xrange, receivers.zrange, -transmissionloss'
+        receivers.xrange, receivers.zrange, -transmission_loss'
     end
 end
 
@@ -670,10 +669,8 @@ function fit!(model::PlaneWaveCurvModel, measurements;
     return model
 end
 
-# Make PlaneWaveCurvModel compatible with Flux automatic differentiation
-Flux.@functor PlaneWaveCurvModel
 # Only train A, phi, and theta; keep d fixed to avoid confusing the optimizer
-Flux.trainable(m::PlaneWaveCurvModel) = (m.A, m.phi, m.theta)
+# Flux.trainable(m::PlaneWaveddddCurvModel) = (m.A, m.phi, m.theta)
 
 """
     calculatefield(model::PlaneWaveCurvModel, rx_coords::AbstractMatrix, k::Real)
@@ -763,5 +760,3 @@ end
 function UnderwaterAcoustics.check(::Type{GPR}, env::Union{<:DataDrivenUnderwaterEnvironment,Missing})
     env
 end =#
-
-

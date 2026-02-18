@@ -2,34 +2,26 @@
 # Case 1: PlaneWaveCurvModel — field calculation, training, and utilities
 # ============================================================================
 
+"""
+    calculate_field(model, coord, k)
+
+RayBasis-style forward model used in the Capsule:
+- Input coords are 2×N with x (range) and z (depth, positive).
+- Output is transmission loss in dB.
+"""
 function calculate_field(model::PlaneWaveCurvModel, coord::AbstractArray, k::Number)
-    # 1. Unpack Coordinates (Vectorized for batch processing)
-    r = coord[1, :]
-    z = coord[3, :]
+    x = @view coord[1:1, :]
+    y = @view coord[2:2, :]
+    T = eltype(coord)
+    xₒ = (T(0), T(0))
 
-    # 2. Define the "Singer" function
-    # This calculates the wave for ONE ray (index i)
-    function ray_contribution(i)
-        r_local = r .- 1000.0
+    xx = x .- (xₒ[1] .- model.d .* cos.(model.theta))
+    yy = y .- (xₒ[2] .- model.d .* sin.(model.theta))
+    l = sqrt.(xx.^2 + yy.^2)
+    kx = k .* l .+ model.phi
+    ray_field = model.A .* cis.(kx)
 
-        # Unpack parameters for this specific ray
-        θ = model.theta[i]
-        d = model.d[i]
-        A = model.A[i]
-        ϕ = model.phi[i]
-
-        # Calculate Phase (Plane + Curvature)
-        phase_plane = k .* (r_local .* cos(θ) .+ z .* sin(θ))
-        phase_curv = (k .* z.^2) ./ (2 * d)
-
-        # Return the Complex Pressure for this ray
-        return A .* cis.(phase_plane .+ phase_curv .+ ϕ)
-    end
-
-    # 3. Summation (Superposition)
-    # We sum the contributions of all rays (1 to nrays).
-    # Zygote loves 'sum' because it knows exactly how to differentiate it.
-    return sum(ray_contribution(i) for i in 1:model.nrays)
+    return amp2db.(abs.(sum(ray_field; dims = 1)))
 end
 
 
@@ -119,77 +111,62 @@ Train the PlaneWaveCurvModel to fit training data.
 # Returns
 - `loss_history`: Vector of loss values at each logging interval
 """
-function fit!(model::PlaneWaveCurvModel, train_locs, train_meas;
-              init_angles=:auto,
-              source_depth=0.0,
+function fit!(model::PlaneWaveCurvModel, rx_train, rx_val, TL_train, TL_val;
               reinit=false,
-              max_epochs=5000,
-              learning_rate=0.01,
-              verbose=true,
-              log_interval=500,
-              min_curvature=50.0,
-              alpha=1e-4)
+              initial_lr=0.5f0,
+              threshold_count=5000,
+              threshold_lr=1e-6,
+              show=false,
+              max_epochs=10_000_000_000)
 
     T = eltype(model.theta)
     nrays = model.nrays
+
     needs_init = all(model.theta .== 0) || reinit
-
     if needs_init
-        verbose && @info "Initializing parameters..."
-        model.theta .= initialize_angles(model.env, nrays, init_angles, T; source_depth=source_depth)
-        model.A .= rand(T, nrays) .* T(0.1)
-        model.phi .= zeros(T, nrays)
+        model.theta .= rand(T, nrays) .* T(π)
+        model.A .= rand(T, nrays)
+        model.phi .= rand(T, nrays) .* T(π)
+        model.d .= rand(T, nrays)
     end
 
-    # --- THE PAPER'S LOSS FUNCTION ---
-    # 1. MSE on Amplitude (Linear, normalized 0-1)
-    # 2. L1 Penalty on Amplitudes (Enforces Sparsity)
-    loss_fn(pred, target) = begin
-        mse_term = Flux.mse(abs.(pred), abs.(target))
-        l1_term = alpha * sum(abs, model.A)
-        return mse_term + l1_term
-    end
+    k = T(2) * T(π) * model.env.frequency / model.env.soundspeed
 
-    opt = Flux.Adam(learning_rate)
-    ps = Flux.params(model)
-    target_amp = abs.(vec(train_meas))
-    k = 2π * model.env.frequency / model.env.soundspeed
+    loss_func(x, y) = (Flux.Losses.mse(calculate_field(model, x, k), y))^0.5f0
+    data_loss_func(x, y) = (Flux.Losses.mse(calculate_field(model, x, k), y))^0.5f0
 
-    # Training loop
-    loss_history = Float64[]
+    best_model = [copy(p) for p in Flux.params(model)]
+    best_loss = data_loss_func(rx_val, TL_val)
+    count = 0
+    opt = Flux.Adam(initial_lr)
 
     for epoch in 1:max_epochs
-        # Optional: Decay LR for fine-tuning
-        if epoch == 3000
-             opt.eta *= 0.1
-             verbose && println("   [Scheduler] Dropping LR to $(opt.eta)")
-        end
+        Flux.train!(loss_func, Flux.params(model), [(rx_train, TL_train)], opt)
+        tmploss = data_loss_func(rx_val, TL_val)
 
-        grads = Flux.gradient(ps) do
-            preds = calculate_field(model, train_locs, k)
-            loss_fn(preds, target_amp)
-        end
-        Flux.update!(opt, ps, grads)
-
-        # Clamp Curvature
-        for i in 1:model.nrays
-            if abs(model.d[i]) < min_curvature
-                model.d[i] = sign(model.d[i]) * min_curvature
+        if best_loss > tmploss
+            best_loss = tmploss
+            best_model = [deepcopy(p) for p in Flux.params(model)]
+            count = 0
+            if show
+                @show epoch, data_loss_func(rx_train, TL_train), data_loss_func(rx_val, TL_val)
             end
+        else
+            count += 1
         end
 
-        if verbose && (epoch % log_interval == 0)
-            preds = calculate_field(model, train_locs, k)
-            curr_mse = Flux.mse(abs.(preds), target_amp)
-            l1_val = sum(abs, model.A)
-
-            println("   Epoch $epoch: MSE = $(round(curr_mse, digits=6)) | L1 Sum = $(round(l1_val, digits=4))")
-            push!(loss_history, curr_mse)
+        if count > threshold_count
+            count = 0
+            # Manually copy the best weights back into the model
+            for (p, b) in zip(Flux.params(model), best_model)
+                p .= b
+            end
+            opt.eta /= 10.0f0
+            opt.eta < threshold_lr && break
         end
     end
 
-    verbose && println("   Training complete!")
-    return loss_history
+    return model
 end
 
 
@@ -198,11 +175,11 @@ end
 
 Stack range and depth coordinates into a 3×N array for model input.
 """
-function stack_coordinates(r, z)
-    train_locs = zeros(3, length(r))
-    train_locs[1, :] = r
-    train_locs[3, :] = z
-    return train_locs
+function stack_coordinates(x, z)
+    locs = zeros(eltype(x), 2, length(x))
+    locs[1, :] = x
+    locs[2, :] = z
+    return locs
 end
 
 
