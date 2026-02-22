@@ -55,13 +55,6 @@ function train_model!(model, loss_func, data_loss_func, rx_train, rx_val, TL_tra
     for epoch in 1:10_000_000_000
         Flux.train!(loss_func, Flux.params(model), [(rx_train, TL_train)], opt)
 
-        if epoch == 1
-            println("=== CHECKPOINT 3: AFTER EPOCH 1 ===")
-            println("New Sum of A: ", sum(Flux.params(model)[1]))
-            println("New Train Loss: ", data_loss_func(rx_train, TL_train))
-            # Force the loop to crash so you can read the terminal
-            error("Stopping early for Checkpoint 3 comparison.")
-        end
 
         tmploss = data_loss_func(rx_val, TL_val)
         if best_loss > tmploss
