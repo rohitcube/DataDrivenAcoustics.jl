@@ -24,6 +24,8 @@ struct RayBasis{T1<:AbstractVector,T2<:Real}
     k::T2
 end
 
+Random.seed!(42)
+
 RayBasis(rays::Integer, k::Real) = RayBasis(rand(Float32, rays) * π, rand(Float32, rays), rand(Float32, rays) * π, rand(Float32, rays), k)
 
 Flux.@functor RayBasis
@@ -41,20 +43,80 @@ function (r::RayBasis)(xy::AbstractArray)
     amp2db.(abs.(sum(real_im_amp; dims = 1)))
 end
 
+import Flux.Optimise: apply!, AbstractOptimiser
+
+# 1. The exact struct from Flux 0.13.9, now officially tagged as a legacy optimizer
+mutable struct LegacyADAM <: AbstractOptimiser
+  eta::Float64
+  beta::Tuple{Float64, Float64}
+  epsilon::Float64
+  state::IdDict{Any, Any}
+end
+
+# 2. The exact constructor
+LegacyADAM(η = 0.001, β = (0.9, 0.999), ϵ = 1e-8) = LegacyADAM(η, β, ϵ, IdDict())
+
+# 3. The exact update math from 2022
+function apply!(o::LegacyADAM, x, Δ)
+  η, β, ϵ = o.eta, o.beta, o.epsilon
+  mt, vt, βp = get!(o.state, x) do
+    (zero(x), zero(x), Float64[β[1], β[2]])
+  end
+  @. mt = β[1] * mt + (1 - β[1]) * Δ
+  @. vt = β[2] * vt + (1 - β[2]) * Δ * conj(Δ)
+  @. Δ =  mt / (1 - βp[1]) / (sqrt(vt / (1 - βp[2])) + ϵ) * η
+  βp .= βp .* β
+  return Δ
+end
+
 function train_model!(model, loss_func, data_loss_func, rx_train, rx_val, TL_train, TL_val; initial_lr = 0.05f0, threshold_count = 5000, threshold_lr = 1e-6, show = false)
     best_model = [deepcopy(p) for p in Flux.params(model)]
     best_loss = data_loss_func(rx_val, TL_val)
     count = 0
-    opt = Flux.Adam(initial_lr)
+    opt = LegacyADAM(initial_lr)
 
     println("=== CHECKPOINT 2: INITIAL LOSS ===")
     println("Pre-train Train Loss: ", data_loss_func(rx_train, TL_train))
     println("Pre-train Val Loss: ", data_loss_func(rx_val, TL_val))
 
+    # ---------------------------------------------------------
+    # === CHECKPOINT 2.5: THE BACKWARD PASS (BEFORE EPOCH 1) ===
+    # ---------------------------------------------------------
+    println("=== CHECKPOINT 2.5: GRADIENT CHECK ===")
+    ps = Flux.params(model)
+
+    # Run the calculus engine before the loop starts
+    grads = Flux.gradient(ps) do
+        loss_func(rx_train, TL_train)
+    end
+
+    # Explicitly pull the gradients for the exact named fields in RayBasis
+    for (name, param) in [("A", model.A), ("θ", model.θ), ("d", model.d), ("ϕ", model.ϕ)]
+        grad_p = grads[param]
+        println("--- Parameter $name ---")
+
+        if grad_p === nothing
+            println("Type: Nothing (Gradient not tracked or disconnected!)")
+        else
+            println("Type: ", typeof(grad_p))
+            # Safely print up to the first 3 elements using standard indexing
+            n_items = min(length(grad_p), 3)
+            println("Gradient (first $n_items): ", grad_p[1:n_items])
+        end
+    end
+    println("============================================")
+    # ---------------------------------------------------------
+
     # ONLY ONE LOOP!
     for epoch in 1:10_000_000_000
         Flux.train!(loss_func, Flux.params(model), [(rx_train, TL_train)], opt)
 
+        if epoch == 1
+            println("=== CHECKPOINT 3: AFTER EPOCH 1 ===")
+            println("New Sum of A: ", sum(Flux.params(model)[1]))
+            println("New Train Loss: ", data_loss_func(rx_train, TL_train))
+            # Force the loop to crash so you can read the terminal
+        end
 
         tmploss = data_loss_func(rx_val, TL_val)
         if best_loss > tmploss
@@ -130,6 +192,8 @@ function generate_test_data(pm, tx, f, xmin, xrange, xs, zmin, zrange, zs; IsTwo
         (rx_test = vcat(repeat(x, 1, length(z)), zeros(Float32, 1, length(x) * length(z)), repeat(z, inner = (1, length(x)))))
     return rx_test, reshape(TL, 1, length(TL))
 end
+
+
 
 # ============================================================================
 # END TEST HELPER FUNCTIONS
