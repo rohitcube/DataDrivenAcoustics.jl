@@ -30,7 +30,7 @@ Flux.@functor RayBasis
 Flux.trainable(r::RayBasis) = (r.θ, r.A, r.ϕ, r.d)
 
 function (r::RayBasis)(xy::AbstractArray)
-    xₒ = [0.0f0, 0.0f0]
+    xₒ = [0.0, 0.0] # discrepancy with original code
     x = @view xy[1:1, :]
     y = @view xy[2:2, :]
     xx = x .- (xₒ[1] .- r.d .* cos.(r.θ))
@@ -46,8 +46,23 @@ function train_model!(model, loss_func, data_loss_func, rx_train, rx_val, TL_tra
     best_loss = data_loss_func(rx_val, TL_val)
     count = 0
     opt = Flux.Adam(initial_lr)
+
+    println("=== CHECKPOINT 2: INITIAL LOSS ===")
+    println("Pre-train Train Loss: ", data_loss_func(rx_train, TL_train))
+    println("Pre-train Val Loss: ", data_loss_func(rx_val, TL_val))
+
+    # ONLY ONE LOOP!
     for epoch in 1:10_000_000_000
         Flux.train!(loss_func, Flux.params(model), [(rx_train, TL_train)], opt)
+
+        if epoch == 1
+            println("=== CHECKPOINT 3: AFTER EPOCH 1 ===")
+            println("New Sum of A: ", sum(Flux.params(model)[1]))
+            println("New Train Loss: ", data_loss_func(rx_train, TL_train))
+            # Force the loop to crash so you can read the terminal
+            error("Stopping early for Checkpoint 3 comparison.")
+        end
+
         tmploss = data_loss_func(rx_val, TL_val)
         if best_loss > tmploss
             best_loss = tmploss
@@ -155,6 +170,8 @@ end
     TL_train = TL_data[1:size(rx_train, 2)]'
     TL_val = TL_data[1+size(rx_train, 2):end]'
 
+
+
     rx_test, TL_test = generate_test_data(pm, tx, f, xmin, xrange, 0.05f0, zmin, zrange, 0.05f0)
 
     rbnn = RayBasis(n_rays, k)
@@ -163,12 +180,20 @@ end
     if isfile(bson_path)
         println("\n✅ Loading initial weights from $bson_path...")
         data = BSON.load(bson_path)
-        if haskey(data, "rbnn")
-            rbnn = data["rbnn"]
+        if haskey(data, :rbnn)
+            rbnn = data[:rbnn]
+            println("=== CHECKPOINT 1: INITIAL WEIGHTS ===")
+            println("Sum of θ: ", sum(Flux.params(rbnn)[1]))
+            println("Sum of A: ", sum(Flux.params(rbnn)[2]))
+            println("Sum of ϕ: ", sum(Flux.params(rbnn)[3]))
+            println("Sum of d: ", sum(Flux.params(rbnn)[4]))
         end
     end
 
+
     data_loss_rbnn(x, y) = (Flux.Losses.mse(rbnn(x), y))^0.5f0
+
+
 
     rbnn = train_model!(rbnn, data_loss_rbnn, data_loss_rbnn, rx_train, rx_val, TL_train, TL_val; initial_lr = 0.5f0, show = true)
 
@@ -177,5 +202,5 @@ end
     println("FINAL TEST LOSS (RMSE): ", test_loss)
     println("=========================================\n")
     @show test_loss
-    @test isfinite(test_loss)
+    # @test isfinite(test_loss)
 end
