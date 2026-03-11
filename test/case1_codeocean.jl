@@ -11,7 +11,6 @@ using DataFrames
 using BSON
 using DSP: amp2db
 
-
 # ============================================================================
 # TEST HELPER FUNCTIONS
 # ============================================================================
@@ -24,7 +23,7 @@ struct RayBasis{T1<:AbstractVector,T2<:Real}
     k::T2
 end
 
-Random.seed!(42)
+
 
 RayBasis(rays::Integer, k::Real) = RayBasis(rand(Float32, rays) * π, rand(Float32, rays), rand(Float32, rays) * π, rand(Float32, rays), k)
 
@@ -106,16 +105,33 @@ function train_model!(model, loss_func, data_loss_func, rx_train, rx_val, TL_tra
     end
     println("============================================")
     # ---------------------------------------------------------
-
+    A_prev = copy(model.A)
     # ONLY ONE LOOP!
     for epoch in 1:10_000_000_000
         Flux.train!(loss_func, Flux.params(model), [(rx_train, TL_train)], opt)
-
         if epoch == 1
             println("=== CHECKPOINT 3: AFTER EPOCH 1 ===")
             println("New Sum of A: ", sum(Flux.params(model)[1]))
             println("New Train Loss: ", data_loss_func(rx_train, TL_train))
             # Force the loop to crash so you can read the terminal
+            mt, vt, βp = opt.state[model.A]
+
+            println("--- OPTIMIZER STATE LOG (Epoch 1) ---")
+            println("Sum of Momentum (mt) for A: ", sum(mt))
+            println("Sum of Velocity (vt) for A: ", sum(vt))
+            println("Current Beta Power (βp): ", βp)
+            println("-------------------------------------")
+        end
+
+        if epoch % 1000 == 0
+            standard_sum_A = sum(model.A)
+            current_movement = sum(abs.(model.A .- A_prev))
+
+            println("--- Epoch $epoch Summary ---")
+            println("Current Sum of A: $standard_sum_A")
+            println("Movement since last check: $current_movement")
+
+            A_prev = copy(model.A) # Reset the speedometer
         end
 
         tmploss = data_loss_func(rx_val, TL_val)
@@ -130,11 +146,16 @@ function train_model!(model, loss_func, data_loss_func, rx_train, rx_val, TL_tra
             count += 1
         end
         if count > threshold_count
+            println(">>> EVENT: LR DROP at Epoch $epoch")
+            println(">>> Sum of A at failure: ", sum(model.A))
+            println(">>> Loss was stuck at: $best_loss")
+
             count = 0
             for (p, b) in zip(Flux.params(model), best_model)
                 p .= b
             end
             opt.eta /= 10.0f0
+            A_prev = copy(model.A)
             opt.eta < threshold_lr && break
         end
     end
@@ -203,7 +224,7 @@ end
 
     c = 1541.0f0
     f = 10000.0f0
-    k = 2.0f0 * Float32(π) * f / c
+    k = 2.0f0 * π * f / c
     L = 30.0f0
     tx = [0.0f0, 5.0f0]
     xmin = 1000.0f0
@@ -231,6 +252,26 @@ end
 
     rx_test, TL_test = generate_test_data(pm, tx, f, xmin, xrange, 0.05f0, zmin, zrange, 0.05f0)
 
+    # --- OVERRIDE WITH CAPSULE DATA ---
+    println("Injecting capsule test data...")
+    # Read directly from your Downloads folder
+    raw_rx = parse.(Float64, readlines("/Users/rohit/Downloads/capsule-0716173 (1)/code/capsule_rx_test.csv"))
+
+    # Note: If your earlier check said TL_test was Float64, change Float32 to Float64 here!
+    raw_TL = parse.(Float64, readlines("/Users/rohit/Downloads/capsule-0716173 (1)/code/capsule_TL_test.csv"))
+
+    # Reshape the flat lists back into matrices using your local sizes
+    capsule_rx_test = reshape(raw_rx, size(rx_test))
+    capsule_TL_test = reshape(raw_TL, size(TL_test))
+
+
+
+
+    println("=== TEST DATA CHECKSUM ===")
+    println("Sum of rx_test (Grid): ", sum((capsule_rx_test)))
+    println("Sum of TL_test (Acoustics): ", sum((capsule_TL_test)))
+    println("==========================")
+
     rbnn = RayBasis(n_rays, k)
 
     bson_path = "src/bson_logs/ini_RBNN.bson"
@@ -252,9 +293,9 @@ end
 
 
 
-    rbnn = train_model!(rbnn, data_loss_rbnn, data_loss_rbnn, rx_train, rx_val, TL_train, TL_val; initial_lr = 0.5f0, show = true)
+    rbnn = train_model!(rbnn, data_loss_rbnn, data_loss_rbnn, rx_train, rx_val, TL_train, TL_val; initial_lr = 0.5f0, show = false)
 
-    test_loss = data_loss_rbnn(rx_test, TL_test)
+    test_loss = data_loss_rbnn(capsule_rx_test, capsule_TL_test)
     println("\n=========================================")
     println("FINAL TEST LOSS (RMSE): ", test_loss)
     println("=========================================\n")
